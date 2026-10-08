@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 import time
@@ -12,7 +13,9 @@ from services.storage.base import StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
-CONFIG_FILE = BASE_DIR / "config.json"
+DEFAULT_CONFIG_FILE = BASE_DIR / "config.json"
+# 容器部署时可指向持久化卷（如 /app/data/config.json），避免重启后后台设置丢失
+CONFIG_FILE = Path(os.getenv("CHATGPT2API_CONFIG_FILE") or DEFAULT_CONFIG_FILE)
 VERSION_FILE = BASE_DIR / "VERSION"
 BACKUP_STATE_FILE = DATA_DIR / "backup_state.json"
 
@@ -664,4 +667,13 @@ def save_backup_state(state: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
+def _seed_config_file(path: Path, default_path: Path = DEFAULT_CONFIG_FILE) -> None:
+    """自定义配置路径首次使用时，以内置的 config.json 作为初始内容。"""
+    if path == default_path or path.exists() or not default_path.is_file():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(default_path, path)
+
+
+_seed_config_file(CONFIG_FILE)
 config = ConfigStore(CONFIG_FILE)

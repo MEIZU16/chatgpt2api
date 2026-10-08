@@ -58,6 +58,28 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_seed_config_file_copies_default_only_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            base_dir = Path(tmp_dir)
+            default_path = base_dir / "config.json"
+            default_path.write_text(json.dumps({"image_retention_days": 30}), encoding="utf-8")
+            target = base_dir / "data" / "config.json"
+
+            self.config_module._seed_config_file(target, default_path)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"image_retention_days": 30})
+
+            target.write_text(json.dumps({"image_retention_days": 3}), encoding="utf-8")
+            self.config_module._seed_config_file(target, default_path)
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"image_retention_days": 3})
+
+    def test_seed_config_file_skips_default_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            default_path = Path(tmp_dir) / "config.json"
+
+            self.config_module._seed_config_file(default_path, default_path)
+
+            self.assertFalse(default_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
