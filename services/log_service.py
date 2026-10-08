@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import itertools
+import os
+import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -21,19 +24,35 @@ from utils.helper import anthropic_sse_stream, sse_json_stream
 LOG_TYPE_CALL = "call"
 LOG_TYPE_ACCOUNT = "account"
 INTERNAL_RESPONSE_KEYS = {"_account_email", "_conversation_id"}
+# 按块读写日志文件，避免把整个 logs.jsonl 读进内存
+READ_CHUNK_SIZE = 1024 * 1024
+DEFAULT_LOG_MAX_MB = 50
+# 超过上限时只保留最新的这一比例，避免每次追加都触发裁剪
+LOG_TRIM_KEEP_RATIO = 0.8
+ID_PREFIX = b'{"id":"'
+
+
+def _log_max_bytes() -> int:
+    try:
+        value = int(os.getenv("CHATGPT2API_LOG_MAX_MB") or DEFAULT_LOG_MAX_MB)
+    except ValueError:
+        value = DEFAULT_LOG_MAX_MB
+    return max(0, value) * 1024 * 1024
 
 
 class LogService:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, max_bytes: int | None = None):
         self.path = path
+        self.max_bytes = _log_max_bytes() if max_bytes is None else max(0, max_bytes)
+        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _legacy_id(raw_line: str, line_number: int) -> str:
-        payload = f"{line_number}:{raw_line}".encode("utf-8", errors="ignore")
+    def _legacy_id(raw_line: str, offset: int) -> str:
+        payload = f"{offset}:{raw_line}".encode("utf-8", errors="ignore")
         return hashlib.sha1(payload).hexdigest()[:24]
 
-    def _parse_line(self, raw_line: str, line_number: int) -> dict[str, Any] | None:
+    def _parse_line(self, raw_line: str, offset: int) -> dict[str, Any] | None:
         try:
             item = json.loads(raw_line)
         except Exception:
@@ -41,8 +60,65 @@ class LogService:
         if not isinstance(item, dict):
             return None
         parsed = dict(item)
-        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line, line_number))
+        parsed["id"] = str(parsed.get("id") or self._legacy_id(raw_line, offset))
         return parsed
+
+    @staticmethod
+    def _decode_line(raw: bytes) -> str:
+        return raw.rstrip(b"\r\n").decode("utf-8", errors="replace")
+
+    def _iter_lines_reversed(self) -> Iterator[tuple[int, str]]:
+        """从文件末尾按块向前读取，逐行产出 (行首字节偏移, 行内容)。"""
+        with self.path.open("rb") as file:
+            position = file.seek(0, os.SEEK_END)
+            remainder = b""
+            while position > 0:
+                size = min(READ_CHUNK_SIZE, position)
+                position -= size
+                file.seek(position)
+                pieces = (file.read(size) + remainder).split(b"\n")
+                # 第一段可能是被块边界截断的行，留给下一轮与更前面的数据拼接
+                remainder = pieces[0]
+                offset = position + len(remainder) + 1
+                located: list[tuple[int, bytes]] = []
+                for piece in pieces[1:]:
+                    located.append((offset, piece))
+                    offset += len(piece) + 1
+                for line_offset, piece in reversed(located):
+                    if piece.strip():
+                        yield line_offset, self._decode_line(piece)
+            if remainder.strip():
+                yield 0, self._decode_line(remainder)
+
+    def _line_id(self, raw: bytes, offset: int) -> tuple[str, dict[str, Any] | None]:
+        """返回日志行的 id；只有缺少 id 的旧格式行才返回解析后的条目。"""
+        if raw.startswith(ID_PREFIX):
+            end = raw.find(b'"', len(ID_PREFIX))
+            if end > len(ID_PREFIX):
+                return raw[len(ID_PREFIX):end].decode("utf-8", errors="replace"), None
+        line = self._decode_line(raw)
+        try:
+            item = json.loads(line)
+        except Exception:
+            return "", None
+        if not isinstance(item, dict):
+            return "", None
+        if item.get("id"):
+            return str(item["id"]), None
+        parsed = self._parse_line(line, offset)
+        return (str(parsed["id"]), parsed) if parsed else ("", None)
+
+    def _trim_locked(self, size: int) -> None:
+        """只保留最新的一部分日志（从行首开始），流式复制，不占用额外内存。"""
+        keep = int(self.max_bytes * LOG_TRIM_KEEP_RATIO)
+        tmp_path = self.path.with_name(f"{self.path.name}.tmp")
+        with self.path.open("rb") as src:
+            if size > keep:
+                src.seek(size - keep)
+                src.readline()
+            with tmp_path.open("wb") as dst:
+                shutil.copyfileobj(src, dst, READ_CHUNK_SIZE)
+        os.replace(tmp_path, self.path)
 
     @staticmethod
     def _serialize_item(item: dict[str, Any]) -> str:
@@ -68,16 +144,20 @@ class LogService:
             "summary": summary,
             "detail": detail or data,
         }
-        with self.path.open("a", encoding="utf-8") as file:
-            file.write(self._serialize_item(item) + "\n")
+        line = (self._serialize_item(item) + "\n").encode("utf-8")
+        with self._lock:
+            with self.path.open("ab") as file:
+                file.write(line)
+                size = file.tell()
+            if self.max_bytes and size > self.max_bytes:
+                self._trim_locked(size)
 
     def list(self, type: str = "", start_date: str = "", end_date: str = "", limit: int = 200) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         items: list[dict[str, Any]] = []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        for line_number in range(len(lines) - 1, -1, -1):
-            item = self._parse_line(lines[line_number], line_number)
+        for offset, raw_line in self._iter_lines_reversed():
+            item = self._parse_line(raw_line, offset)
             if item is None:
                 continue
             if not self._matches_filters(item, type=type, start_date=start_date, end_date=end_date):
@@ -91,22 +171,29 @@ class LogService:
         target_ids = {str(item or "").strip() for item in ids if str(item or "").strip()}
         if not self.path.exists() or not target_ids:
             return {"removed": 0}
-        lines = self.path.read_text(encoding="utf-8").splitlines()
-        kept_lines: list[str] = []
+        tmp_path = self.path.with_name(f"{self.path.name}.tmp")
         removed = 0
-        for line_number, raw_line in enumerate(lines):
-            item = self._parse_line(raw_line, line_number)
-            if item is None:
-                kept_lines.append(raw_line)
-                continue
-            if str(item.get("id") or "") in target_ids:
-                removed += 1
-                continue
-            kept_lines.append(self._serialize_item(item))
-        content = "\n".join(kept_lines)
-        if content:
-            content += "\n"
-        self.path.write_text(content, encoding="utf-8")
+        with self._lock:
+            with self.path.open("rb") as src, tmp_path.open("wb") as dst:
+                offset = 0
+                for raw in src:
+                    line_offset = offset
+                    offset += len(raw)
+                    if not raw.strip():
+                        continue
+                    item_id, legacy_item = self._line_id(raw, line_offset)
+                    if item_id and item_id in target_ids:
+                        removed += 1
+                        continue
+                    if legacy_item is not None:
+                        # 旧格式日志的 id 依赖行偏移，删除后会变化，因此写回时固定下来
+                        dst.write((self._serialize_item(legacy_item) + "\n").encode("utf-8"))
+                    else:
+                        dst.write(raw if raw.endswith(b"\n") else raw + b"\n")
+            if removed:
+                os.replace(tmp_path, self.path)
+            else:
+                tmp_path.unlink(missing_ok=True)
         return {"removed": removed}
 
 

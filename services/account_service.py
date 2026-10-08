@@ -45,6 +45,8 @@ class AccountService:
     # 重新登录进度追踪
     _relogin_progress: dict[str, dict] = {}
     _relogin_progress_lock = Lock()
+    # 进度记录（含全量账号快照）超过该时长未更新即清理
+    _PROGRESS_TTL_SECONDS = 30 * 60
 
     def __init__(self, storage_backend: StorageBackend):
         self.storage = storage_backend
@@ -53,6 +55,7 @@ class AccountService:
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
         self._accounts = self._load_accounts()
+        self._accounts_dirty = False
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
@@ -127,6 +130,13 @@ class AccountService:
 
     def _save_accounts(self) -> None:
         self.storage.save_accounts(list(self._accounts.values()))
+        self._accounts_dirty = False
+
+    def _flush_accounts(self) -> None:
+        """把仅在内存中更新（persist=False）的账号统一落盘一次。"""
+        with self._lock:
+            if self._accounts_dirty:
+                self._save_accounts()
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -1213,7 +1223,14 @@ class AccountService:
             items = [dict(item) for item in self._accounts.values()]
         return {"removed": removed, "items": items}
 
-    def update_account(self, access_token: str, updates: dict, quiet: bool = False) -> dict | None:
+    def update_account(
+        self,
+        access_token: str,
+        updates: dict,
+        quiet: bool = False,
+        persist: bool = True,
+        log_status_change_only: bool = False,
+    ) -> dict | None:
         if not access_token:
             return None
         with self._lock:
@@ -1230,8 +1247,12 @@ class AccountService:
                 log_service.add(LOG_TYPE_ACCOUNT, "自动移除限流账号", {"token": anonymize_token(access_token)})
                 return None
             self._accounts[access_token] = account
-            self._save_accounts()
-            if not quiet:
+            if persist:
+                self._save_accounts()
+            else:
+                self._accounts_dirty = True
+            status_changed = account.get("status") != current.get("status")
+            if not quiet and (status_changed or not log_status_change_only):
                 log_service.add(LOG_TYPE_ACCOUNT, "更新账号",
                                 {"token": anonymize_token(access_token), "status": account.get("status")})
             return dict(account)
@@ -1337,6 +1358,7 @@ class AccountService:
         access_token: str,
         event: str = "fetch_remote_info",
         defer_invalid_removal: bool = True,
+        persist: bool = True,
     ) -> dict[str, Any] | None:
         if not access_token:
             raise ValueError("access_token is required")
@@ -1378,13 +1400,22 @@ class AccountService:
                     self.remove_invalid_token(active_token, event)
                 raise
         self._record_refresh_success(active_token)
-        return self.update_account(active_token, result)
+        # 定时刷新会反复拉取所有账号，只有状态变化才值得记日志
+        return self.update_account(active_token, result, persist=persist, log_status_change_only=True)
 
     # ---- 刷新进度追踪 ----
+
+    @classmethod
+    def _prune_progress_locked(cls, progress_map: dict[str, dict]) -> None:
+        """清理长时间未更新的进度记录，避免已完成的刷新结果一直留在内存中。"""
+        cutoff = time.time() - cls._PROGRESS_TTL_SECONDS
+        for progress_id in [key for key, value in progress_map.items() if value.get("updated_at", 0) < cutoff]:
+            progress_map.pop(progress_id, None)
 
     def init_refresh_progress(self, progress_id: str, total: int) -> None:
         """初始化刷新进度记录。"""
         with self._refresh_progress_lock:
+            self._prune_progress_locked(self._refresh_progress)
             self._refresh_progress[progress_id] = {
                 "total": total,
                 "processed": 0,
@@ -1392,6 +1423,7 @@ class AccountService:
                 "error": None,
                 "status_counts": {"正常": 0, "限流": 0, "异常": 0, "禁用": 0},
                 "total_quota": 0,
+                "updated_at": time.time(),
             }
 
     def update_refresh_progress(self, progress_id: str, token: str) -> None:
@@ -1407,6 +1439,7 @@ class AccountService:
             progress["processed"] += 1
             progress["status_counts"][status] = progress["status_counts"].get(status, 0) + 1
             progress["total_quota"] += quota
+            progress["updated_at"] = time.time()
 
     def finish_refresh_progress(self, progress_id: str, result: dict | None = None, error: str | None = None) -> None:
         """标记刷新完成。"""
@@ -1416,6 +1449,7 @@ class AccountService:
                 return
             progress["done"] = True
             progress["result"] = result
+            progress["updated_at"] = time.time()
             if error:
                 progress["error"] = error
 
@@ -1435,12 +1469,14 @@ class AccountService:
     def init_relogin_progress(self, progress_id: str, total: int) -> None:
         """初始化重新登录进度记录。"""
         with self._relogin_progress_lock:
+            self._prune_progress_locked(self._relogin_progress)
             self._relogin_progress[progress_id] = {
                 "total": total,
                 "processed": 0,
                 "done": False,
                 "error": None,
                 "results": [],
+                "updated_at": time.time(),
             }
 
     def update_relogin_progress(self, progress_id: str, token: str, status: str, error: str | None = None) -> None:
@@ -1455,6 +1491,7 @@ class AccountService:
                 "status": status,
                 "error": error,
             })
+            progress["updated_at"] = time.time()
             if progress["processed"] >= progress["total"]:
                 progress["done"] = True
 
@@ -1466,6 +1503,7 @@ class AccountService:
                 return
             progress["done"] = True
             progress["result"] = result
+            progress["updated_at"] = time.time()
             if error:
                 progress["error"] = error
 
@@ -1503,8 +1541,9 @@ class AccountService:
 
         executor = ThreadPoolExecutor(max_workers=max_workers)
         try:
+            # 批量刷新期间只更新内存，结束后统一落盘一次，避免每个账号都重写整个账号文件
             futures = {
-                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal): token
+                executor.submit(self.fetch_remote_info, token, "refresh_accounts", defer_invalid_removal, False): token
                 for token in access_tokens
             }
             for future in as_completed(futures):
@@ -1533,6 +1572,8 @@ class AccountService:
             raise
         else:
             executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            self._flush_accounts()
 
         # 自动重新登录异常账号（仅当配置开启时）
         relogined = 0

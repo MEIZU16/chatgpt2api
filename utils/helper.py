@@ -1,4 +1,6 @@
 import base64
+import ctypes
+import functools
 import hashlib
 import json
 import mimetypes
@@ -104,6 +106,22 @@ def normalize_json_edit_images(image: object = None, images: object = None) -> l
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+@functools.cache
+def _glibc() -> ctypes.CDLL | None:
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+    except OSError:
+        return None
+    return libc if hasattr(libc, "malloc_trim") else None
+
+
+def release_free_memory() -> None:
+    """把 glibc 中已释放但未归还的堆内存交还给操作系统；非 glibc 平台为空操作。"""
+    libc = _glibc()
+    if libc is not None:
+        libc.malloc_trim(0)
 
 
 def split_image_model(model: object) -> tuple[str | None, str | None]:
