@@ -158,6 +158,23 @@ class BackendSentinelTests(unittest.TestCase):
         self.assertEqual(requirements.token, "requirements-token")
         self.assertEqual(requirements.turnstile_token, "turnstile-value")
 
+    def test_bootstrap_omits_oai_headers_and_restores_them(self) -> None:
+        api = OpenAIBackendAPI(access_token="token")
+        seen: dict[str, str] = {}
+
+        def fake_get(url, headers=None, timeout=None):
+            seen.update(api.session.headers)
+            seen.update(headers or {})
+            return FakeResponse(200, "<html></html>")
+
+        api.session.get = fake_get
+        oai_before = {k: v for k, v in api.session.headers.items() if k.lower().startswith("oai-")}
+        self.assertTrue(oai_before)
+        with mock.patch.object(backend_module, "ensure_ok"):
+            api._bootstrap()
+        self.assertFalse([k for k in seen if k.lower().startswith("oai-")])
+        self.assertEqual({k: v for k, v in api.session.headers.items() if k.lower().startswith("oai-")}, oai_before)
+
     def test_sentinel_user_agent_falls_back_to_request_user_agent(self) -> None:
         api = OpenAIBackendAPI(access_token="token")
         with mock.patch.object(backend_module, "solver_user_agent", return_value=""):

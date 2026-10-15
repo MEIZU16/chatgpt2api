@@ -2670,12 +2670,22 @@ class OpenAIBackendAPI:
                 pass
 
     def _bootstrap(self) -> None:
-        """预热首页，并提取 PoW 相关脚本引用。"""
-        response = self.session.get(
-            self.base_url + "/",
-            headers=self._bootstrap_headers(),
-            timeout=30,
-        )
+        """预热首页，并提取 PoW 相关脚本引用。
+
+        首页是浏览器导航请求，不能带会话级的 OAI-* 接口头：带上后不少代理 IP 会被
+        Cloudflare 托管挑战拦成 403（cf-mitigated: challenge），去掉即可正常通过。
+        """
+        oai_headers = {key: value for key, value in self.session.headers.items() if key.lower().startswith("oai-")}
+        for key in oai_headers:
+            del self.session.headers[key]
+        try:
+            response = self.session.get(
+                self.base_url + "/",
+                headers=self._bootstrap_headers(),
+                timeout=30,
+            )
+        finally:
+            self.session.headers.update(oai_headers)
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
