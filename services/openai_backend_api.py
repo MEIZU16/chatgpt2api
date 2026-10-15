@@ -524,13 +524,14 @@ class OpenAIBackendAPI:
 
     @staticmethod
     def _normalize_thinking_effort(value: str) -> str:
+        """上游 thinking_effort 只接受 standard/extended/max（对应网页「思考」），low/medium/high 会返回 422。"""
         normalized = str(value or "").strip().lower()
-        if normalized in {"", "none", "auto"}:
-            return ""
-        if normalized in {"low", "medium", "high", "standard", "max"}:
-            return normalized
-        if normalized in {"xhigh", "extended"}:
+        if normalized in {"low", "medium", "standard"}:
+            return "standard"
+        if normalized in {"high", "xhigh", "extended"}:
             return "extended"
+        if normalized == "max":
+            return "max"
         return ""
 
     def _conversation_payload(

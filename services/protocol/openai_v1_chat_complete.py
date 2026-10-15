@@ -45,13 +45,14 @@ TOOL_UNAVAILABLE_SYSTEM_MESSAGE = (
 
 
 def normalize_thinking_effort(value: object) -> str:
+    """把 OpenAI 的 reasoning effort 映射到网页「思考」的档位；上游只认 standard/extended/max，传 low/medium/high 会返回 422。"""
     normalized = str(value or "").strip().lower()
-    if normalized in {"", "none"}:
-        return ""
-    if normalized in {"low", "medium", "high"}:
-        return normalized
-    if normalized in {"xhigh", "extended"}:
+    if normalized in {"low", "medium", "standard"}:
+        return "standard"
+    if normalized in {"high", "xhigh", "extended"}:
         return "extended"
+    if normalized == "max":
+        return "max"
     return ""
 
 

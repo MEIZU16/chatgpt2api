@@ -6,6 +6,7 @@ import json
 import base64
 
 from services.config import config
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol import openai_v1_chat_complete, openai_v1_response
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache
 from services.protocol.conversation import iter_conversation_payloads, sanitize_output_text
@@ -77,6 +78,18 @@ class ChatCompletionCacheTests(unittest.TestCase):
         self.assertNotEqual(default_key, thinking_key)
         self.assertNotEqual(default_key, reasoning_key)
         self.assertNotEqual(thinking_key, reasoning_key)
+
+    def test_reasoning_effort_maps_to_upstream_levels(self) -> None:
+        # 上游只认 standard/extended/max，low/medium/high 原样传会返回 422
+        cases = {
+            "low": "standard", "medium": "standard", "standard": "standard",
+            "high": "extended", "xhigh": "extended", "extended": "extended",
+            "max": "max", "none": "", "auto": "", "": "",
+        }
+        for value, expected in cases.items():
+            self.assertEqual(openai_v1_chat_complete.normalize_thinking_effort(value), expected, value)
+            self.assertEqual(openai_v1_response.normalize_thinking_effort(value), expected, value)
+            self.assertEqual(OpenAIBackendAPI._normalize_thinking_effort(value), expected, value)
 
     def test_chat_completion_reasoning_effort_reaches_conversation_request(self) -> None:
         captured_efforts: list[str] = []
