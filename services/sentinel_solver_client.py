@@ -1,8 +1,9 @@
 """调用 sentinel 求解服务（sentinel_solver/）计算 Turnstile token。
 
 2026-10-14 起 chatgpt.com 只接受在真实页面里算出的 Turnstile；缺失时对话接口返回 403，
-低质量时返回伪装成 404 的 "Model not found"。求解服务未配置或调用失败时退回本地求解器，
-本地求解器已跟不上新版挑战程序，只作兜底。
+低质量时返回伪装成 404 的 "Model not found"。求解服务未配置或求解失败时直接报错（SentinelSolverError），
+不再退回本地求解器：它已跟不上新版挑战程序，算出的 token 只会换来伪装 404，并白白耗掉重试次数。
+求解服务只收到挑战材料（dx、p、prepare 响应），账号 token、cookie 和用户提示词都留在主服务。
 """
 from __future__ import annotations
 
@@ -13,13 +14,18 @@ from curl_cffi import requests
 
 from services.config import config
 from utils.log import logger
-from utils.turnstile import solve_turnstile_token
 
 SOLVER_TIMEOUT_SECONDS = 20
+# 页面自带的 turnstile 模块在冷页面上首次加载会慢一些
+SOLVER_SOLVE_TIMEOUT_SECONDS = 60
 USER_AGENT_CACHE_SECONDS = 600
 
 _user_agent_lock = threading.Lock()
 _user_agent_cache: dict[str, object] = {"url": "", "value": {}, "expires_at": 0.0}
+
+
+class SentinelSolverError(RuntimeError):
+    """求解服务未配置，或没能算出 Turnstile token。"""
 
 
 def _solver_headers() -> dict[str, str]:
@@ -67,26 +73,38 @@ def solver_environment() -> dict:
     return dict(environment) if isinstance(environment, dict) else {}
 
 
-def solve_turnstile(dx: str, p: str) -> str:
-    """dx 为 prepare 响应里的 turnstile.dx，p 为 prepare 请求提交的 requirements token。"""
+def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:
+    """dx 为 prepare 响应里的 turnstile.dx，p 为 prepare 请求提交的 requirements token。
+
+    requirements 是完整的 prepare 响应，传给求解服务后它会调用页面自带的 turnstile 模块，
+    不传时只能用移植的 VM。
+    """
     base_url = config.sentinel_solver_url
-    if base_url:
-        try:
-            response = requests.post(
-                f"{base_url}/v1/turnstile",
-                headers=_solver_headers(),
-                json={"dx": dx, "p": p},
-                timeout=SOLVER_TIMEOUT_SECONDS,
-            )
-            if response.status_code == 200:
-                token = str((response.json() or {}).get("token") or "")
-                if token:
-                    return token
-            logger.warning({
-                "event": "sentinel_solver_failed",
-                "status": response.status_code,
-                "body": str(response.text or "")[:200],
-            })
-        except Exception as exc:
-            logger.warning({"event": "sentinel_solver_error", "error": str(exc)})
-    return solve_turnstile_token(dx, p) or ""
+    if not base_url:
+        raise SentinelSolverError(
+            "sentinel solver is not configured (CHATGPT2API_SENTINEL_SOLVER_URL / config.json sentinel_solver_url)"
+        )
+    body: dict[str, object] = {"dx": dx, "p": p}
+    if requirements:
+        body["requirements"] = requirements
+    try:
+        response = requests.post(
+            f"{base_url}/v1/turnstile",
+            headers=_solver_headers(),
+            json=body,
+            timeout=SOLVER_SOLVE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning({"event": "sentinel_solver_error", "error": str(exc)})
+        raise SentinelSolverError(f"sentinel solver request failed: {exc}") from exc
+    if response.status_code != 200:
+        logger.warning({
+            "event": "sentinel_solver_failed",
+            "status": response.status_code,
+            "body": str(response.text or "")[:200],
+        })
+        raise SentinelSolverError(f"sentinel solver returned HTTP {response.status_code}: {str(response.text or '')[:200]}")
+    token = str((response.json() or {}).get("token") or "")
+    if not token:
+        raise SentinelSolverError("sentinel solver returned an empty turnstile token")
+    return token

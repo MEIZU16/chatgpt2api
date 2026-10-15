@@ -57,6 +57,8 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._accounts_dirty = False
         self._image_inflight: dict[str, int] = {}
+        # 生图返回伪装 404 的账号在本进程内暂避到此时刻（time.monotonic），不改额度和账号状态
+        self._image_unavailable_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -908,6 +910,7 @@ class AccountService:
             token
             for item in self._accounts.values()
             if self._is_image_account_available(item)
+               and self._image_unavailable_until.get(item.get("access_token") or "", 0.0) <= time.monotonic()
                and self._account_matches_plan_type(item, plan_type)
                and self._account_matches_any_plan_type(item, plan_types)
                and self._account_matches_source_type(item, source_type)
@@ -950,6 +953,13 @@ class AccountService:
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
+
+    def sideline_image_account(self, access_token: str, seconds: int) -> None:
+        """在本进程内暂时不选这个账号生图；不清额度、不标记失效，也不影响代理健康分。"""
+        with self._image_slot_condition:
+            access_token = self._resolve_access_token_locked(access_token)
+            self._image_unavailable_until[access_token] = time.monotonic() + seconds
+            self._image_slot_condition.notify_all()
 
     def release_image_slot(self, access_token: str) -> None:
         if not access_token:

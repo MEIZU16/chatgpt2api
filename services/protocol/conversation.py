@@ -17,6 +17,7 @@ from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
 from utils.helper import (
     IMAGE_MODELS,
+    UpstreamHTTPError,
     extract_image_from_message_content,
     is_codex_image_model,
     is_supported_image_model,
@@ -24,6 +25,19 @@ from utils.helper import (
 )
 from utils.image_tokens import count_image_content_tokens
 from utils.log import logger
+
+
+# 生图对话返回伪装 404 "Model not found" 时，这个账号在本进程内暂避的秒数
+IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS = 10 * 60
+
+
+def is_image_model_not_found_error(error: Exception | str) -> bool:
+    """只匹配生图对话接口返回的、detail 精确为 Model not found 的 404。"""
+    if not isinstance(error, UpstreamHTTPError):
+        return False
+    if error.status_code != 404 or error.context != "/backend-api/f/conversation":
+        return False
+    return isinstance(error.body, dict) and error.body.get("detail") == "Model not found"
 
 
 class ImageGenerationError(Exception):
@@ -1305,6 +1319,7 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    model_not_found_retry_count = 0
 
     text_reply_retry_count = 0
     tls_retry_count = 0
@@ -1483,6 +1498,12 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            if not emitted_for_token and is_image_model_not_found_error(exc):
+                # 只在本地暂避这个账号、换号重试，不改额度、有效性或代理健康分
+                account_service.sideline_image_account(token, IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS)
+                model_not_found_retry_count += 1
+                if model_not_found_retry_count <= MAX_POLL_TIMEOUT_RETRIES:
+                    continue
             if not emitted_for_token and is_token_invalid_error(last_error):
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:

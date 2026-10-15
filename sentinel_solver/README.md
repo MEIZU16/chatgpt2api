@@ -15,7 +15,7 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 页面状态、页面 UA 和浏览器环境（时区、语言、核数等），主服务据此生成 requirements/proof token |
-| POST | `/v1/turnstile` | `{"dx", "p"}` → `{"token"}`，dx 取自 prepare 响应，p 是 prepare 请求提交的 requirements token |
+| POST | `/v1/turnstile` | `{"p", "dx", "requirements"}` → `{"token"}`。p 是 prepare 请求提交的 requirements token，dx 和 requirements（完整 prepare 响应）取自 prepare 响应；带 requirements 时优先调用页面自带的 turnstile 模块，失败再用移植的 VM。结果会校验，算不出有效 token 时返回 503 |
 | POST | `/v1/so` | `{"collector_dx", "snapshot_dx", "p"}` → `{"token"}`，目前对话接口还不强制要求 |
 
 设置了 `SENTINEL_SOLVER_KEY` 时，请求需要带 `Authorization: Bearer <key>` 头。
@@ -33,7 +33,7 @@ CHATGPT2API_SENTINEL_SOLVER_URL=http://sentinel-solver:8080
 CHATGPT2API_SENTINEL_SOLVER_KEY=<与 SENTINEL_SOLVER_KEY 相同>
 ```
 
-未配置或调用失败时，主服务会退回本地 Turnstile 求解器。本地求解器已跟不上新版挑战程序，对话接口大概率会失败。
+未配置或求解失败时，主服务直接报错（SentinelSolverError），不再退回本地求解器：它已跟不上新版挑战程序，算出的 token 只会换来伪装 404。
 
 环境变量：
 
@@ -50,5 +50,5 @@ CHATGPT2API_SENTINEL_SOLVER_KEY=<与 SENTINEL_SOLVER_KEY 相同>
 ## 注意
 
 - 必须使用完整 Chromium 的新版无头模式（`channel="chromium"`），并加上 stealth；否则页面会停在 Cloudflare「请稍候…」，算出的 token 无效。
-- 挑战程序（`vm.js`）移植自 chatgpt.com 前端，OpenAI 更新指令集后需要同步更新。
+- 求解时优先调用页面自带的 turnstile 模块（做法参考 basketikun/chatgpt2api#418 与 239573049/WebImage），前端更新后无需改代码；`vm.js` 移植自 chatgpt.com 前端，只作兜底，OpenAI 更新指令集后需要同步更新。
 - 本服务只解决请求质量问题。由脚本批量注册的账号，即使在真实网页里也会提示 "Model not found"，属于账号层面的限制。

@@ -20,6 +20,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import uvicorn
@@ -28,6 +29,8 @@ from playwright.async_api import Browser, BrowserContext, Page, Playwright, asyn
 from playwright_stealth import Stealth
 from pydantic import BaseModel
 
+from turnstile_result import is_retryable_solve_error, validate_turnstile_token
+
 CHATGPT_URL = "https://chatgpt.com/"
 CHALLENGE_TITLES = ("请稍候", "Just a moment", "Attention Required")
 VM_SCRIPT = (Path(__file__).parent / "vm.js").read_text(encoding="utf-8")
@@ -35,6 +38,57 @@ BASE_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = window.chrome || { runtime: {} };
 """
+# 优先调用 chatgpt.com 自带的 turnstile 模块在本页面里算 token：手工移植的 VM 要跟着前端改动同步，
+# 页面模块则始终是最新版。思路来自 basketikun/chatgpt2api#418（pansx），页面模块做法见 239573049/WebImage（MIT）。
+# 模块文件名带内容哈希、每次前端发布都会变，所以求解时现场查找，固定路径只作最后兜底。
+PINNED_TURNSTILE_ASSET = "/unauth-mweb/assets/turnstile-DykPLDEM.js"
+DISCOVER_TURNSTILE_ASSET = """() => {
+  const pattern = /\\/turnstile-[^/"']+\\.js/;
+  const seen = [];
+  const push = (url) => { if (url && pattern.test(url) && !seen.includes(url)) seen.push(url); };
+  try { performance.getEntriesByType('resource').forEach((e) => push(e.name)); } catch (err) {}
+  try { Array.from(document.scripts).forEach((s) => push(s.src)); } catch (err) {}
+  return seen;
+}"""
+SCAN_TURNSTILE_ASSET = """async (pattern) => {
+  const re = new RegExp(pattern);
+  for (const script of Array.from(document.scripts)) {
+    if (!script.src) continue;
+    try {
+      const hit = (await (await fetch(script.src)).text()).match(re);
+      if (hit) return hit[0];
+    } catch (err) {}
+  }
+  return null;
+}"""
+SOLVE_VIA_PAGE_MODULE = """async ([requirements, p, asset]) => {
+  try {
+    const mod = await import(asset);
+    const turnstile = mod.turnstile || (mod.default && mod.default.turnstile);
+    if (!turnstile || typeof turnstile.getEnforcementToken !== 'function') return 'ERR:getEnforcementToken missing';
+    // 模块用 WeakMap 以 requirements 为键取 p；token 缓存也是 WeakMap，不能动，否则会直接回显 p 而不跑挑战
+    const cache = turnstile.tokenCache;
+    const original = WeakMap.prototype.get;
+    WeakMap.prototype.get = function (target) {
+      if (this === cache) return original.call(this, target);
+      return target === requirements ? p : original.call(this, target);
+    };
+    let token;
+    try {
+      token = await turnstile.getEnforcementToken(requirements);
+    } finally {
+      WeakMap.prototype.get = original;
+    }
+    return String(token === undefined || token === null ? '' : token);
+  } catch (error) {
+    return 'ERR:' + String(error).slice(0, 300);
+  }
+}"""
+SOLVE_VIA_VM = "([dx, p]) => window.__sentinelVM.turnstile(dx, p)"
+# page.evaluate 没有单次超时，首次加载模块可能较慢，放宽上下文默认超时
+PAGE_MODULE_TIMEOUT_MS = 120000
+PAGE_MODULE_ATTEMPTS = 3
+
 # 主服务据此生成 requirements/proof token 里的浏览器字段，使其与算 Turnstile 的页面一致
 ENVIRONMENT_SCRIPT = """() => ({
     screen_sum: screen.width + screen.height,
@@ -76,6 +130,7 @@ class SolverPage:
         self._lock = asyncio.Lock()
         self.user_agent = USER_AGENT
         self.environment: dict[str, object] = {}
+        self._turnstile_asset = ""
         self.last_error = ""
 
     async def start(self) -> None:
@@ -137,6 +192,7 @@ class SolverPage:
         if TIMEZONE:
             context_kwargs["timezone_id"] = TIMEZONE
         context = await self._browser.new_context(**context_kwargs)
+        context.set_default_timeout(PAGE_MODULE_TIMEOUT_MS)
         await context.add_init_script(BASE_INIT_SCRIPT)
         await context.add_init_script(VM_SCRIPT)
         await Stealth().apply_stealth_async(context)
@@ -167,6 +223,58 @@ class SolverPage:
             return await page.evaluate("location.hostname === 'chatgpt.com' && typeof window.__sentinelVM === 'object'")
         except Exception:
             return False
+
+    async def turnstile_asset(self) -> str:
+        """找到本页面实际加载的 turnstile 模块地址；找不到时扫描页面脚本，再不行用固定路径。"""
+        if self._turnstile_asset:
+            return self._turnstile_asset
+        try:
+            loaded = await self.evaluate(DISCOVER_TURNSTILE_ASSET, None)
+            if loaded:
+                self._turnstile_asset = str(loaded[0])
+            else:
+                scanned = await self.evaluate(SCAN_TURNSTILE_ASSET, r"/unauth-mweb/assets/turnstile-[A-Za-z0-9_-]+\.js")
+                self._turnstile_asset = str(scanned or "")
+        except Exception as exc:
+            self.last_error = str(exc)
+        if not self._turnstile_asset:
+            self._turnstile_asset = PINNED_TURNSTILE_ASSET
+        print(f"[sentinel-solver] turnstile asset: {self._turnstile_asset}", flush=True)
+        return self._turnstile_asset
+
+    async def solve_turnstile(self, requirements: dict[str, Any] | None, dx: str, p: str) -> tuple[bool, str]:
+        """优先用页面自带模块求解，失败再退回移植的 VM；返回 (是否成功, token 或失败原因)。"""
+        if requirements:
+            error = ""
+            for attempt in range(1, PAGE_MODULE_ATTEMPTS + 1):
+                asset = await self.turnstile_asset()
+                try:
+                    raw = str(await self.evaluate(SOLVE_VIA_PAGE_MODULE, [requirements, p, asset]) or "")
+                except Exception as exc:
+                    error = str(exc)
+                    break
+                if raw.startswith("ERR:"):
+                    error = raw[4:]
+                    break
+                error = validate_turnstile_token(raw, p)
+                if not error:
+                    return True, raw
+                # 只有冷页面上的 VM 超时值得在热页面上重试
+                if not is_retryable_solve_error(error) or attempt == PAGE_MODULE_ATTEMPTS:
+                    break
+                print(f"[sentinel-solver] {error} (attempt {attempt}/{PAGE_MODULE_ATTEMPTS})", flush=True)
+            self.last_error = error[:300]
+            print(f"[sentinel-solver] page module solve failed: {error[:300]}", flush=True)
+            # 下次重新查找模块并重开页面
+            self._turnstile_asset = ""
+            await self.invalidate()
+        if not dx:
+            return False, self.last_error or "no dx and no requirements supplied"
+        result = str(await self.evaluate(SOLVE_VIA_VM, [dx, p]) or "")
+        if result.startswith("ERR:"):
+            return False, result[4:]
+        error = validate_turnstile_token(result, p)
+        return (False, error) if error else (True, result)
 
     async def evaluate(self, expression: str, arg: object) -> object:
         """在页面里执行；页面失效时重开一次再试。"""
@@ -207,8 +315,10 @@ app = FastAPI(title="chatgpt2api sentinel solver", lifespan=lifespan)
 
 
 class TurnstileRequest(BaseModel):
-    dx: str
     p: str
+    dx: str = ""
+    # 完整的 chat-requirements/prepare 响应，只含挑战材料，不含账号 token、cookie 或用户提示词
+    requirements: dict[str, Any] | None = None
 
 
 class SORequest(BaseModel):
@@ -234,10 +344,12 @@ async def health() -> dict[str, object]:
 async def solve_turnstile(body: TurnstileRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
     require_key(authorization)
     try:
-        token = await solver.evaluate("([dx, p]) => window.__sentinelVM.turnstile(dx, p)", [body.dx, body.p])
+        ok, token = await solver.solve_turnstile(body.requirements, body.dx, body.p)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"turnstile solve failed: {exc}") from exc
-    return {"token": str(token or "")}
+    if not ok:
+        raise HTTPException(status_code=503, detail=f"turnstile solve failed: {token[:300]}")
+    return {"token": token}
 
 
 @app.post("/v1/so")

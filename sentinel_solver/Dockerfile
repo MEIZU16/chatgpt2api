@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps --no-shell chromium \
     && rm -rf /var/lib/apt/lists/*
 
-COPY app.py vm.js ./
+COPY app.py vm.js turnstile_result.py ./
 
 EXPOSE 8080
 CMD ["python", "app.py"]

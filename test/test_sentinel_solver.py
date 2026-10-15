@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import unittest
+from http.cookiejar import Cookie, CookieJar
+from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("CHATGPT2API_AUTH_KEY", "test-auth")
@@ -46,18 +48,29 @@ class SentinelSolverClientTests(unittest.TestCase):
         self.assertEqual(kwargs["json"], {"dx": "dx-value", "p": "p-value"})
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer solver-key")
 
-    def test_solve_turnstile_falls_back_to_local_solver_when_solver_fails(self) -> None:
+    def test_solve_turnstile_sends_prepare_response_for_page_module(self) -> None:
+        prepare = {"prepare_token": "t", "turnstile": {"required": True, "dx": "dx"}}
         with solver_config(), mock.patch.object(
-            client_module.requests, "post", side_effect=RuntimeError("connection refused")
-        ), mock.patch.object(client_module, "solve_turnstile_token", return_value="local") as local:
-            self.assertEqual(client_module.solve_turnstile("dx", "p"), "local")
-        local.assert_called_once_with("dx", "p")
+            client_module.requests, "post", return_value=FakeResponse(200, {"token": "solved"})
+        ) as post:
+            client_module.solve_turnstile("dx", "p", prepare)
+        self.assertEqual(post.call_args.kwargs["json"]["requirements"], prepare)
 
-    def test_solve_turnstile_without_solver_uses_local_solver(self) -> None:
-        with solver_config(url=""), mock.patch.object(client_module.requests, "post") as post, mock.patch.object(
-            client_module, "solve_turnstile_token", return_value=None
-        ):
-            self.assertEqual(client_module.solve_turnstile("dx", "p"), "")
+    def test_solve_turnstile_fails_closed_when_solver_fails(self) -> None:
+        with solver_config(), mock.patch.object(client_module.requests, "post", side_effect=RuntimeError("connection refused")):
+            with self.assertRaises(client_module.SentinelSolverError):
+                client_module.solve_turnstile("dx", "p")
+        with solver_config(), mock.patch.object(client_module.requests, "post", return_value=FakeResponse(503, {"detail": "x"})):
+            with self.assertRaises(client_module.SentinelSolverError):
+                client_module.solve_turnstile("dx", "p")
+        with solver_config(), mock.patch.object(client_module.requests, "post", return_value=FakeResponse(200, {"token": ""})):
+            with self.assertRaises(client_module.SentinelSolverError):
+                client_module.solve_turnstile("dx", "p")
+
+    def test_solve_turnstile_without_solver_raises(self) -> None:
+        with solver_config(url=""), mock.patch.object(client_module.requests, "post") as post:
+            with self.assertRaises(client_module.SentinelSolverError):
+                client_module.solve_turnstile("dx", "p")
         post.assert_not_called()
 
     def test_solver_user_agent_is_cached(self) -> None:
@@ -116,6 +129,7 @@ class FakeSession:
         self.responses = responses
         self.calls: list[tuple[str, dict]] = []
         self.headers: dict[str, str] = {}
+        self.cookies = SimpleNamespace(jar=CookieJar())
 
     def post(self, url: str, **kwargs):
         self.calls.append((url, kwargs))
@@ -147,7 +161,9 @@ class BackendSentinelTests(unittest.TestCase):
 
         self.assertEqual(build_p.call_args.args[0], "SolverUA/1.0")
         self.assertEqual(build_proof.call_args.args[2], "SolverUA/1.0")
-        solve.assert_called_once_with("dx-value", "p-value")
+        solve.assert_called_once()
+        self.assertEqual(solve.call_args.args[:2], ("dx-value", "p-value"))
+        self.assertEqual(solve.call_args.args[2]["prepare_token"], "prepare-token")
         finalize_url, finalize_kwargs = api.session.calls[-1]
         self.assertTrue(finalize_url.endswith("/sentinel/chat-requirements/finalize"))
         self.assertEqual(finalize_kwargs["json"], {
@@ -174,6 +190,21 @@ class BackendSentinelTests(unittest.TestCase):
             api._bootstrap()
         self.assertFalse([k for k in seen if k.lower().startswith("oai-")])
         self.assertEqual({k: v for k, v in api.session.headers.items() if k.lower().startswith("oai-")}, oai_before)
+
+    def test_finalize_drops_only_the_restricted_oai_sc_cookie(self) -> None:
+        def cookie(name: str) -> Cookie:
+            return Cookie(0, name, "v", None, False, ".chatgpt.com", True, True, "/", True, True, None, False, None, None, {})
+
+        api = OpenAIBackendAPI(access_token="token")
+        api.session = FakeSession({
+            "/prepare": FakeResponse(200, {"prepare_token": "p", "proofofwork": {"required": False}}),
+            "/finalize": FakeResponse(200, {"token": "requirements-token"}),
+        })
+        for name in ("oai-sc", "__cf_bm", "oai-did"):
+            api.session.cookies.jar.set_cookie(cookie(name))
+        with mock.patch.object(backend_module, "build_legacy_requirements_token", return_value="p-value"):
+            api._get_chat_requirements()
+        self.assertEqual(sorted(c.name for c in api.session.cookies.jar), ["__cf_bm", "oai-did"])
 
     def test_sentinel_user_agent_falls_back_to_request_user_agent(self) -> None:
         api = OpenAIBackendAPI(access_token="token")

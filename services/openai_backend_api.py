@@ -70,7 +70,31 @@ DEFAULT_CLIENT_BUILD_NUMBER = "6708908"
 DEFAULT_POW_SCRIPT = "https://chatgpt.com/backend-api/sentinel/sdk.js"
 # 2026-10-14 起 chrome110 的 TLS 指纹会被判为低可信，对话接口返回伪装成 404 的 "Model not found"。
 DEFAULT_IMPERSONATE = "chrome146"
-LEGACY_IMPERSONATES = {"chrome110"}
+LEGACY_IMPERSONATES = {"chrome110", "edge101"}
+# 请求头里的浏览器身份要和 TLS 指纹（DEFAULT_IMPERSONATE）是同一个 Chrome，不能混用 Edge 身份
+_FINGERPRINT_BROWSER_VERSION = DEFAULT_IMPERSONATE.removeprefix("chrome") or "146"
+FINGERPRINT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{_FINGERPRINT_BROWSER_VERSION}.0.0.0 Safari/537.36"
+)
+FINGERPRINT_SEC_CH_UA = (
+    f'"Chromium";v="{_FINGERPRINT_BROWSER_VERSION}", '
+    f'"Google Chrome";v="{_FINGERPRINT_BROWSER_VERSION}", "Not/A)Brand";v="99"'
+)
+FINGERPRINT_FULL_VERSION = f'"{_FINGERPRINT_BROWSER_VERSION}.0.0.0"'
+# 生图请求体按网页 2026-10 的抓包对齐
+CLIENT_CREATED_ROOT = "client-created-root"
+IMAGE_CREATION_MENTION = "@创建图像"
+IMAGE_CLIENT_CONTEXTUAL_INFO = {
+    "app_name": "chatgpt.com",
+    "app_surface": "codex_browser",
+    "has_web_push_capabilities": True,
+    "web_push_notification_permission": "default",
+}
+FINGERPRINT_FULL_VERSION_LIST = (
+    f'"Chromium";v="{_FINGERPRINT_BROWSER_VERSION}.0.0.0", '
+    f'"Google Chrome";v="{_FINGERPRINT_BROWSER_VERSION}.0.0.0", "Not/A)Brand";v="99.0.0.0"'
+)
 CODEX_IMAGE_MODEL = "codex-gpt-image-2"
 CODEX_RESPONSES_MODEL = "gpt-5.5"
 SEARCH_MODEL = "gpt-5-5"
@@ -183,6 +207,8 @@ class OpenAIBackendAPI:
         self.session_id = self.fp["oai-session-id"]
         self.pow_script_sources: list[str] = []
         self.pow_data_build = ""
+        # 网页上同一次生图的 f/conversation/prepare 和 f/conversation 共用一个 turn trace id
+        self._image_turn_trace_id = ""
         self.progress_callback: Callable[[str], None] | None = None
         self.session = requests.Session(**proxy_settings.build_session_kwargs(
             account=self.account,
@@ -200,8 +226,8 @@ class OpenAIBackendAPI:
             "Sec-Ch-Ua": self.fp["sec-ch-ua"],
             "Sec-Ch-Ua-Arch": '"x86"',
             "Sec-Ch-Ua-Bitness": '"64"',
-            "Sec-Ch-Ua-Full-Version": '"143.0.3650.96"',
-            "Sec-Ch-Ua-Full-Version-List": '"Microsoft Edge";v="143.0.3650.96", "Chromium";v="143.0.7499.147", "Not A(Brand";v="24.0.0.0"',
+            "Sec-Ch-Ua-Full-Version": FINGERPRINT_FULL_VERSION,
+            "Sec-Ch-Ua-Full-Version-List": FINGERPRINT_FULL_VERSION_LIST,
             "Sec-Ch-Ua-Mobile": self.fp["sec-ch-ua-mobile"],
             "Sec-Ch-Ua-Model": '""',
             "Sec-Ch-Ua-Platform": self.fp["sec-ch-ua-platform"],
@@ -255,17 +281,16 @@ class OpenAIBackendAPI:
             value = str(account.get(key) or "").strip()
             if value:
                 fp[key] = value
-        fp.setdefault(
-            "user-agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
-        )
         if fp.get("impersonate") in LEGACY_IMPERSONATES:
+            # 旧指纹整套换成与 TLS 一致的新身份，不保留旧 UA
             fp.pop("impersonate")
+            for key in ("user-agent", "sec-ch-ua", "sec-ch-ua-platform"):
+                fp.pop(key, None)
+        fp.setdefault("user-agent", FINGERPRINT_UA)
         fp.setdefault("impersonate", DEFAULT_IMPERSONATE)
         fp.setdefault("oai-device-id", new_uuid())
         fp.setdefault("oai-session-id", new_uuid())
-        fp.setdefault("sec-ch-ua", '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"')
+        fp.setdefault("sec-ch-ua", FINGERPRINT_SEC_CH_UA)
         fp.setdefault("sec-ch-ua-mobile", "?0")
         fp.setdefault("sec-ch-ua-platform", '"Windows"')
         return fp
@@ -291,25 +316,49 @@ class OpenAIBackendAPI:
             raise InvalidAccessTokenError(f"token invalidated ({path})")
         raise RuntimeError(f"{path} failed: HTTP {response.status_code}")
 
+    @staticmethod
+    def _is_cloudflare_challenge(response: requests.Response) -> bool:
+        """只认 Cloudflare 挑战页；JSON 格式的 403 是真正的授权拒绝。"""
+        if response.status_code != 403:
+            return False
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "json" in content_type:
+            return False
+        return str(response.headers.get("cf-mitigated") or "").strip().lower() == "challenge" or "text/html" in content_type
+
+    def _retry_cloudflare_challenge(self, request: Callable[[], requests.Response]) -> requests.Response:
+        """刷新账号信息时遇到临时挑战最多试三次（间隔 1.5s、3s），避免把健康账号误判成无额度。"""
+        response = request()
+        for attempt in range(1, 3):
+            if not self._is_cloudflare_challenge(response):
+                return response
+            time.sleep(1.5 * attempt)
+            response = request()
+        return response
+
     def _get_me(self) -> Dict[str, Any]:
         path = "/backend-api/me"
-        response = self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        response = self._retry_cloudflare_challenge(
+            lambda: self.session.get(self.base_url + path, headers=self._headers(path), timeout=20)
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         return response.json()
 
     def _get_conversation_init(self) -> Dict[str, Any]:
         path = "/backend-api/conversation/init"
-        response = self.session.post(
-            self.base_url + path,
-            headers=self._headers(path, {"Content-Type": "application/json"}),
-            json={
-                "gizmo_id": None,
-                "requested_default_model": None,
-                "conversation_id": None,
-                "timezone_offset_min": -480,
-            },
-            timeout=20,
+        response = self._retry_cloudflare_challenge(
+            lambda: self.session.post(
+                self.base_url + path,
+                headers=self._headers(path, {"Content-Type": "application/json"}),
+                json={
+                    "gizmo_id": None,
+                    "requested_default_model": None,
+                    "conversation_id": None,
+                    "timezone_offset_min": -480,
+                },
+                timeout=20,
+            )
         )
         if response.status_code != 200:
             self._raise_on_error(response, path)
@@ -317,8 +366,10 @@ class OpenAIBackendAPI:
 
     def _get_default_account(self) -> Dict[str, Any]:
         path = "/backend-api/accounts/check/v4-2023-04-27"
-        response = self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
-                                    timeout=20)
+        response = self._retry_cloudflare_challenge(
+            lambda: self.session.get(self.base_url + path + "?timezone_offset_min=-480", headers=self._headers(path),
+                                     timeout=20)
+        )
         if response.status_code != 200:
             self._raise_on_error(response, path)
         payload = response.json()
@@ -401,6 +452,13 @@ class OpenAIBackendAPI:
             "Upgrade-Insecure-Requests": "1",
         }
 
+    def _drop_restricted_cookies(self) -> None:
+        """删掉 finalize 下发的受限 oai-sc cookie，留着它后续对话可能伪装返回 Model not found。"""
+        jar = self.session.cookies.jar
+        for cookie in list(jar):
+            if cookie.name == "oai-sc":
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+
     def _sentinel_user_agent(self) -> str:
         """requirements/proof token 里编码的 UA：与算 Turnstile 的求解页面保持一致。"""
         return solver_user_agent() or self.user_agent
@@ -424,8 +482,8 @@ class OpenAIBackendAPI:
 
         turnstile_token = ""
         turnstile_info = data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile(turnstile_info["dx"], source_p)
+        if turnstile_info.get("required"):
+            turnstile_token = solve_turnstile(turnstile_info.get("dx", ""), source_p, data)
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -609,8 +667,9 @@ class OpenAIBackendAPI:
             headers["OpenAI-Sentinel-SO-Token"] = requirements.so_token
         if conduit_token:
             headers["X-Conduit-Token"] = conduit_token
-        if accept == "text/event-stream":
-            headers["X-Oai-Turn-Trace-Id"] = new_uuid()
+        trace_id = str(self._image_turn_trace_id or "").strip()
+        if accept == "text/event-stream" or trace_id:
+            headers["X-Oai-Turn-Trace-Id"] = trace_id or new_uuid()
         return self._headers(path, headers)
 
     def _codex_responses_headers(self) -> Dict[str, str]:
@@ -882,27 +941,29 @@ class OpenAIBackendAPI:
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
     def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
-        """为图片生成准备 conduit token。"""
+        """为图片生成准备 conduit token；请求体按网页抓包对齐，并开启本次生图共用的 turn trace id。"""
         path = "/backend-api/f/conversation/prepare"
         upstream_model, thinking_effort = self._image_model_settings(model)
+        self._image_turn_trace_id = new_uuid()
         payload = {
             "action": "next",
-            "fork_from_shared_post": False,
-            "parent_message_id": new_uuid(),
+            "is_do_not_remember": False,
             "model": upstream_model,
-            "client_prepare_state": "success",
-            "timezone_offset_min": -480,
-            "timezone": "Asia/Shanghai",
-            "conversation_mode": {"kind": "primary_assistant"},
+            "parent_message_id": CLIENT_CREATED_ROOT,
             "system_hints": ["picture_v2"],
+            "timezone": "Asia/Shanghai",
+            "timezone_offset_min": -480,
+            "client_contextual_info": dict(IMAGE_CLIENT_CONTEXTUAL_INFO),
+            "local_function_names": ["local.continue_in_work"],
+            "supported_encodings": ["v1"],
+            "client_prepare_state": "sent",
             "partial_query": {
                 "id": new_uuid(),
                 "author": {"role": "user"},
                 "content": {"content_type": "text", "parts": [prompt]},
             },
-            "supports_buffering": True,
-            "supported_encodings": ["v1"],
-            "client_contextual_info": {"app_name": "chatgpt.com"},
+            "client_prepare_dispatch": "debounced",
+            "client_prepare_source": "composer_editor_state",
         }
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
@@ -991,9 +1052,14 @@ class OpenAIBackendAPI:
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
                                 references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
-        """启动图片生成或编辑的 SSE 请求。"""
+        """启动图片生成或编辑的 SSE 请求。
+
+        请求体按网页抓包对齐：提示词以「@创建图像」提及开头，metadata 带 picture_v2 的
+        custom_symbol_offsets，消息补齐 recipient/status/weight 等字段。
+        """
         upstream_model, thinking_effort = self._image_model_settings(model)
         references = references or []
+        mention_text = f"{IMAGE_CREATION_MENTION} {prompt}"
         parts = [{
             "content_type": "image_asset_pointer",
             "asset_pointer": f"file-service://{item['file_id']}",
@@ -1001,15 +1067,23 @@ class OpenAIBackendAPI:
             "height": item["height"],
             "size_bytes": item["file_size"],
         } for item in references]
-        parts.append(prompt)
-        content = {"content_type": "multimodal_text", "parts": parts} if references else {"content_type": "text",
-                                                                                          "parts": [prompt]}
+        parts.append(mention_text)
+        content = {"content_type": "multimodal_text", "parts": parts} if references else {
+            "content_type": "text", "parts": [mention_text]}
         metadata = {
             "developer_mode_connector_ids": [],
             "selected_github_repos": [],
             "selected_all_github_repos": False,
             "system_hints": ["picture_v2"],
-            "serialization_metadata": {"custom_symbol_offsets": []},
+            "serialization_metadata": {
+                "render_format": "markdown",
+                "custom_symbol_offsets": [{
+                    "id": "picture_v2",
+                    "symbol": "ecosystemMention",
+                    "startIndex": 0,
+                    "endIndex": len(IMAGE_CREATION_MENTION),
+                }],
+            },
         }
         if references:
             metadata["attachments"] = [{
@@ -1021,36 +1095,32 @@ class OpenAIBackendAPI:
                 "height": item["height"],
             } for item in references]
         payload = {
+            "turn_attribution": {"turn_trigger": "composer"},
             "action": "next",
+            "is_do_not_remember": False,
             "messages": [{
                 "id": new_uuid(),
-                "author": {"role": "user"},
+                "author": {"metadata": {}, "name": None, "role": "user"},
+                "channel": None,
                 "create_time": time.time(),
+                "end_turn": None,
                 "content": content,
                 "metadata": metadata,
+                "recipient": "all",
+                "status": "finished_successfully",
+                "update_time": None,
+                "weight": 1,
             }],
-            "parent_message_id": new_uuid(),
+            "parent_message_id": CLIENT_CREATED_ROOT,
             "model": upstream_model,
-            "client_prepare_state": "sent",
+            "system_hints": ["picture_v2"],
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
-            "conversation_mode": {"kind": "primary_assistant"},
-            "enable_message_followups": True,
-            "system_hints": ["picture_v2"],
-            "supports_buffering": True,
+            "client_contextual_info": dict(IMAGE_CLIENT_CONTEXTUAL_INFO),
+            "local_function_names": ["local.continue_in_work"],
             "supported_encodings": ["v1"],
-            "client_contextual_info": {
-                "is_dark_mode": False,
-                "time_since_loaded": 1200,
-                "page_height": 1072,
-                "page_width": 1724,
-                "pixel_ratio": 1.2,
-                "screen_height": 1440,
-                "screen_width": 2560,
-                "app_name": "chatgpt.com",
-            },
-            "paragen_cot_summary_display_override": "allow",
-            "force_parallel_switch": "auto",
+            "genui_state_snapshots": [],
+            "client_prepare_state": "success",
         }
         if thinking_effort:
             payload["thinking_effort"] = thinking_effort
@@ -2727,8 +2797,9 @@ class OpenAIBackendAPI:
 
         turnstile_token = ""
         turnstile_info = prepare_data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile(turnstile_info["dx"], p_token)
+        if turnstile_info.get("required"):
+            # 传入完整 prepare 响应，让求解服务调用页面自带的 turnstile 模块
+            turnstile_token = solve_turnstile(turnstile_info.get("dx", ""), p_token, prepare_data)
 
         finalize_path = base + "/finalize"
         response = self.session.post(
@@ -2743,6 +2814,7 @@ class OpenAIBackendAPI:
         )
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
+        self._drop_restricted_cookies()
 
         token = data.get("token", "")
         if not token:
