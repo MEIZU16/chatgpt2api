@@ -10,6 +10,7 @@ from services import openai_backend_api as backend_module
 from services import sentinel_solver_client as client_module
 from services.config import config
 from services.openai_backend_api import DEFAULT_IMPERSONATE, ChatRequirements, OpenAIBackendAPI
+from utils import pow as pow_module
 
 
 class FakeResponse:
@@ -32,7 +33,7 @@ def solver_config(url: str = "http://solver:8080", key: str = "solver-key"):
 
 class SentinelSolverClientTests(unittest.TestCase):
     def setUp(self) -> None:
-        client_module._user_agent_cache.update(url="", value="", expires_at=0.0)
+        client_module._user_agent_cache.update(url="", value={}, expires_at=0.0)
 
     def test_solve_turnstile_calls_solver_with_key(self) -> None:
         with solver_config(), mock.patch.object(
@@ -71,6 +72,43 @@ class SentinelSolverClientTests(unittest.TestCase):
         with solver_config(url=""), mock.patch.object(client_module.requests, "get") as get:
             self.assertEqual(client_module.solver_user_agent(), "")
         get.assert_not_called()
+
+    def test_solver_environment_shares_health_cache(self) -> None:
+        health = {"user_agent": "SolverUA/1.0", "environment": {"language": "zh-CN", "hardware_concurrency": 28}}
+        with solver_config(), mock.patch.object(client_module.requests, "get", return_value=FakeResponse(200, health)) as get:
+            self.assertEqual(client_module.solver_environment(), {"language": "zh-CN", "hardware_concurrency": 28})
+            self.assertEqual(client_module.solver_user_agent(), "SolverUA/1.0")
+        get.assert_called_once()
+
+
+class PowTests(unittest.TestCase):
+    ENVIRONMENT = {
+        "screen_sum": 2080,
+        "date_suffix": "GMT+0800 (中国标准时间)",
+        "utc_offset_minutes": 480,
+        "heap_limit": 4395630592,
+        "language": "zh-CN",
+        "languages": "en-US,en",
+        "hardware_concurrency": 28,
+    }
+
+    def test_config_uses_solver_environment(self) -> None:
+        config_fields = pow_module.build_pow_config("UA/1", ["https://chatgpt.com/a.js"], "build", self.ENVIRONMENT)
+        self.assertEqual(len(config_fields), 25)
+        self.assertEqual(config_fields[0], 2080)
+        self.assertTrue(config_fields[1].endswith("GMT+0800 (中国标准时间)"))
+        self.assertEqual(config_fields[2], 4395630592)
+        self.assertEqual(config_fields[7:9], ["zh-CN", "en-US,en"])
+        self.assertEqual(config_fields[16], 28)
+        self.assertLess(config_fields[13], 60000)
+
+    def test_proof_token_matches_web_fnv_check(self) -> None:
+        # seed/difficulty 取自 2026-10-15 抓到的真实 prepare 响应
+        token = pow_module.build_proof_token("0.6466531835161229", "06e4f1", "UA/1", environment=self.ENVIRONMENT)
+        self.assertTrue(token.startswith("gAAAAAB"))
+        self.assertTrue(token.endswith("~S"))
+        answer = token[len("gAAAAAB"):-len("~S")]
+        self.assertLessEqual(pow_module._fnv1a_32("0.6466531835161229" + answer)[:6], "06e4f1")
 
 
 class FakeSession:

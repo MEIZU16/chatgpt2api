@@ -5,7 +5,7 @@
 
 环境变量：
 - SENTINEL_SOLVER_KEY：可选，设置后请求需带 `Authorization: Bearer <key>`
-- SENTINEL_SOLVER_PROXY：可选，浏览器出网代理（如 http://host:7890），应与主服务出口一致
+- SENTINEL_SOLVER_PROXY：可选，浏览器出网代理（如 http://user:pass@host:7890），应与主服务出口一致
 - SENTINEL_SOLVER_USER_AGENT：可选，默认按内置 Chromium 版本生成 Linux Chrome UA
 - SENTINEL_SOLVER_TIMEZONE：可选，页面时区（如 Asia/Tokyo），应与出口 IP 所在地一致；默认跟随系统
 - SENTINEL_SOLVER_REFRESH_SECONDS：页面定期重开的间隔，默认 1800
@@ -20,6 +20,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
@@ -34,6 +35,16 @@ BASE_INIT_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 window.chrome = window.chrome || { runtime: {} };
 """
+# 主服务据此生成 requirements/proof token 里的浏览器字段，使其与算 Turnstile 的页面一致
+ENVIRONMENT_SCRIPT = """() => ({
+    screen_sum: screen.width + screen.height,
+    date_suffix: new Date().toString().replace(/^.*? (GMT[+-]\\d{4})/, '$1'),
+    utc_offset_minutes: -new Date().getTimezoneOffset(),
+    heap_limit: (performance.memory && performance.memory.jsHeapSizeLimit) || null,
+    language: navigator.language,
+    languages: (navigator.languages || []).join(','),
+    hardware_concurrency: navigator.hardwareConcurrency,
+})"""
 
 SOLVER_KEY = os.getenv("SENTINEL_SOLVER_KEY", "").strip()
 PROXY = os.getenv("SENTINEL_SOLVER_PROXY", "").strip()
@@ -42,6 +53,15 @@ TIMEZONE = os.getenv("SENTINEL_SOLVER_TIMEZONE", "").strip()
 REFRESH_SECONDS = max(60, int(os.getenv("SENTINEL_SOLVER_REFRESH_SECONDS", "1800")))
 HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
 READY_TIMEOUT_SECONDS = 60
+
+
+def playwright_proxy(url: str) -> dict[str, str]:
+    """Chromium 不认 URL 里的账号密码，需拆成 Playwright 的 username/password 字段。"""
+    parts = urlsplit(url)
+    if not parts.username:
+        return {"server": url}
+    server = f"{parts.scheme}://{parts.hostname}" + (f":{parts.port}" if parts.port else "")
+    return {"server": server, "username": unquote(parts.username), "password": unquote(parts.password or "")}
 
 
 class SolverPage:
@@ -55,6 +75,7 @@ class SolverPage:
         self._opened_at = 0.0
         self._lock = asyncio.Lock()
         self.user_agent = USER_AGENT
+        self.environment: dict[str, object] = {}
         self.last_error = ""
 
     async def start(self) -> None:
@@ -66,7 +87,7 @@ class SolverPage:
             "args": ["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
         }
         if PROXY:
-            launch_kwargs["proxy"] = {"server": PROXY}
+            launch_kwargs["proxy"] = playwright_proxy(PROXY)
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         if not self.user_agent:
             major = self._browser.version.split(".")[0]
@@ -128,6 +149,7 @@ class SolverPage:
                 await context.close()
                 raise RuntimeError(f"chatgpt.com page not ready (title={title!r}), likely stuck on a Cloudflare challenge")
             await asyncio.sleep(1)
+        self.environment = await page.evaluate(ENVIRONMENT_SCRIPT)
         self._context = context
         self._page = page
         self._opened_at = time.monotonic()
@@ -166,6 +188,7 @@ class SolverPage:
             "browser_version": self._browser.version if self._browser else None,
             "user_agent": self.user_agent,
             "timezone": TIMEZONE or None,
+            "environment": self.environment,
             "last_error": self.last_error or None,
         }
 

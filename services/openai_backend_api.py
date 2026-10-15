@@ -23,7 +23,7 @@ from PIL import Image
 from services.account_service import account_service
 from services.config import config
 from services.proxy_service import proxy_settings
-from services.sentinel_solver_client import solve_turnstile, solver_user_agent
+from services.sentinel_solver_client import solve_turnstile, solver_environment, solver_user_agent
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
 from utils.pow import build_legacy_requirements_token, build_proof_token, parse_pow_resources
@@ -419,6 +419,7 @@ class OpenAIBackendAPI:
                 self._sentinel_user_agent(),
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                environment=solver_environment(),
             )
 
         turnstile_token = ""
@@ -2683,7 +2684,10 @@ class OpenAIBackendAPI:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
         base = "/backend-api/sentinel/chat-requirements" if self.access_token else "/backend-anon/sentinel/chat-requirements"
         sentinel_user_agent = self._sentinel_user_agent()
-        p_token = build_legacy_requirements_token(sentinel_user_agent, self.pow_script_sources, self.pow_data_build)
+        sentinel_environment = solver_environment()
+        p_token = build_legacy_requirements_token(
+            sentinel_user_agent, self.pow_script_sources, self.pow_data_build, environment=sentinel_environment
+        )
 
         prepare_path = base + "/prepare"
         response = self.session.post(
@@ -2707,6 +2711,7 @@ class OpenAIBackendAPI:
                 sentinel_user_agent,
                 script_sources=self.pow_script_sources,
                 data_build=self.pow_data_build,
+                environment=sentinel_environment,
             )
 
         turnstile_token = ""

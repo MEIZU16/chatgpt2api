@@ -4,7 +4,7 @@
 
 - `chat-requirements` 必须带上在**真实 chatgpt.com 页面**里算出的 Turnstile token。纯 Python 或 Node 模拟算出的结果会被拒，缺失时返回 403 "Unusual activity"。
 - 请求的 TLS 指纹必须是新版 Chrome（主服务默认已改为 curl_cffi `chrome146`）。
-- requirements/proof token 里编码的 UA 必须和算 Turnstile 的页面一致。
+- requirements/proof token 里的浏览器字段（UA、时区、语言、核数、内存上限等）要像真实页面，并和算 Turnstile 的页面一致；PoW 使用网页同款 FNV-1a 算法（结果带 `~S` 后缀）。
 
 只要校验质量不够，对话接口不会直接返回 403，而是返回伪装成 404 的 `{"detail":"Model not found"}`。
 
@@ -14,7 +14,7 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/health` | 页面状态及页面使用的 UA（主服务据此生成 requirements/proof token） |
+| GET | `/health` | 页面状态、页面 UA 和浏览器环境（时区、语言、核数等），主服务据此生成 requirements/proof token |
 | POST | `/v1/turnstile` | `{"dx", "p"}` → `{"token"}`，dx 取自 prepare 响应，p 是 prepare 请求提交的 requirements token |
 | POST | `/v1/so` | `{"collector_dx", "snapshot_dx", "p"}` → `{"token"}`，目前对话接口还不强制要求 |
 
