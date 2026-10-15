@@ -338,6 +338,11 @@ class OpenAIBackendAPI:
         """获取当前 token 的账号信息。"""
         if not self.access_token:
             raise RuntimeError("access_token is required")
+        # 先预热首页拿到 Cloudflare cookie；冷会话直接请求 conversation/init 等接口常被 403 挑战页拦截
+        try:
+            self._bootstrap()
+        except Exception as exc:
+            logger.warning({"event": "backend_user_info_bootstrap_failed", "error": str(exc)})
         executor = ThreadPoolExecutor(max_workers=3)
         try:
             me_future = executor.submit(self._get_me)
