@@ -16,6 +16,7 @@
 | --- | --- | --- |
 | GET | `/health` | 页面状态、页面 UA 和浏览器环境（时区、语言、核数等），主服务据此生成 requirements/proof token |
 | POST | `/v1/turnstile` | `{"p", "dx", "requirements"}` → `{"token"}`。p 是 prepare 请求提交的 requirements token，dx 和 requirements（完整 prepare 响应）取自 prepare 响应；带 requirements 时优先调用页面自带的 turnstile 模块，失败再用移植的 VM。结果会校验，算不出有效 token 时返回 503 |
+| POST | `/v1/cf-cookies` | `{"proxy"}` → `{"cookies", "expires_at", "user_agent"}`。走指定代理新开一个页面打开 chatgpt.com，只返回 Cloudflare 的 `__cf_bm`、`_cfuvid`、`__cflb`、`cf_clearance`。主服务在某个代理上被 Cloudflare 挑战时调用，并按代理缓存；cookie 绑定出口 IP，只能用在同一个代理上。最多同时开 2 个页面，取不到时返回 503 |
 | POST | `/v1/so` | `{"collector_dx", "snapshot_dx", "p"}` → `{"token"}`，目前对话接口还不强制要求 |
 
 设置了 `SENTINEL_SOLVER_KEY` 时，请求需要带 `Authorization: Bearer <key>` 头。

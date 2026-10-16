@@ -107,6 +107,10 @@ TIMEZONE = os.getenv("SENTINEL_SOLVER_TIMEZONE", "").strip()
 REFRESH_SECONDS = max(60, int(os.getenv("SENTINEL_SOLVER_REFRESH_SECONDS", "1800")))
 HEADLESS = os.getenv("SENTINEL_SOLVER_HEADLESS", "true").strip().lower() not in {"0", "false", "no"}
 READY_TIMEOUT_SECONDS = 60
+CF_COOKIE_NAMES = ("__cf_bm", "_cfuvid", "__cflb", "cf_clearance")
+CF_COOKIE_TIMEOUT_SECONDS = 30
+# 同时最多开几个取 cookie 的页面，避免一波挑战把容器内存打满
+CF_COOKIE_CONCURRENCY = 2
 
 
 def playwright_proxy(url: str) -> dict[str, str]:
@@ -131,6 +135,7 @@ class SolverPage:
         self.user_agent = USER_AGENT
         self.environment: dict[str, object] = {}
         self._turnstile_asset = ""
+        self._cf_cookie_slots = asyncio.Semaphore(CF_COOKIE_CONCURRENCY)
         self.last_error = ""
 
     async def start(self) -> None:
@@ -289,6 +294,50 @@ class SolverPage:
                 await self.invalidate()
         raise RuntimeError("unreachable")
 
+    async def cloudflare_cookies(self, proxy: str) -> dict[str, object]:
+        """走指定代理新开一个上下文打开 chatgpt.com，取回 Cloudflare 发的 cookie。
+
+        真实浏览器在后端被挑战的 IP 上通常直接 200，只拿到 __cf_bm/_cfuvid 等 cookie；
+        后端带上它们即可通过。cookie 绑定出口 IP，只能给同一个代理用。
+        """
+        if self._browser is None:
+            raise RuntimeError("browser not started")
+        context_kwargs: dict[str, Any] = {
+            "locale": "zh-CN",
+            "viewport": {"width": 1280, "height": 800},
+            "user_agent": self.user_agent,
+        }
+        if proxy:
+            context_kwargs["proxy"] = playwright_proxy(proxy)
+        if TIMEZONE:
+            context_kwargs["timezone_id"] = TIMEZONE
+        async with self._cf_cookie_slots:
+            context = await self._browser.new_context(**context_kwargs)
+            try:
+                await Stealth().apply_stealth_async(context)
+                page = await context.new_page()
+                await page.goto(CHATGPT_URL, wait_until="domcontentloaded", timeout=60000)
+                deadline = time.monotonic() + CF_COOKIE_TIMEOUT_SECONDS
+                while True:
+                    title = await page.title()
+                    cookies = await context.cookies(CHATGPT_URL)
+                    names = {cookie["name"] for cookie in cookies}
+                    challenged = any(marker in title for marker in CHALLENGE_TITLES)
+                    if not challenged and "__cf_bm" in names:
+                        break
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"no Cloudflare cookies (title={title!r}, challenged={challenged})")
+                    await asyncio.sleep(1)
+            finally:
+                await context.close()
+        picked = [cookie for cookie in cookies if cookie["name"] in CF_COOKIE_NAMES]
+        expiries = [float(cookie["expires"]) for cookie in picked if float(cookie.get("expires") or -1) > 0]
+        return {
+            "cookies": {cookie["name"]: cookie["value"] for cookie in picked},
+            "expires_at": min(expiries) if expiries else None,
+            "user_agent": self.user_agent,
+        }
+
     def status(self) -> dict[str, object]:
         return {
             "ready": self._page is not None and not self._page.is_closed(),
@@ -321,6 +370,11 @@ class TurnstileRequest(BaseModel):
     requirements: dict[str, Any] | None = None
 
 
+class CloudflareCookiesRequest(BaseModel):
+    # 主服务要用的出口代理；cookie 绑定出口 IP，必须用同一个代理去取
+    proxy: str = ""
+
+
 class SORequest(BaseModel):
     collector_dx: str
     snapshot_dx: str
@@ -350,6 +404,17 @@ async def solve_turnstile(body: TurnstileRequest, authorization: str | None = He
     if not ok:
         raise HTTPException(status_code=503, detail=f"turnstile solve failed: {token[:300]}")
     return {"token": token}
+
+
+@app.post("/v1/cf-cookies")
+async def cloudflare_cookies(
+    body: CloudflareCookiesRequest, authorization: str | None = Header(default=None)
+) -> dict[str, object]:
+    require_key(authorization)
+    try:
+        return await solver.cloudflare_cookies(body.proxy.strip())
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"cf cookies failed: {str(exc)[:300]}") from exc
 
 
 @app.post("/v1/so")

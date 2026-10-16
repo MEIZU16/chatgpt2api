@@ -19,6 +19,10 @@ def cookie(name: str) -> Cookie:
 
 class BootstrapCloudflareRetryTests(unittest.TestCase):
     def setUp(self):
+        # 这里只测等待重试和换代理；不让挑战去找求解服务刷新 Cloudflare cookie（见 test_cf_cookies.py）
+        mock.patch.object(
+            type(backend_module.config), "sentinel_solver_url", new_callable=mock.PropertyMock, return_value=""
+        ).start()
         backend_module._healthy_bootstrap_proxies.clear()
         self.addCleanup(backend_module._healthy_bootstrap_proxies.clear)
         patcher = mock.patch.object(backend_module.config, "get_proxy_settings", return_value="")

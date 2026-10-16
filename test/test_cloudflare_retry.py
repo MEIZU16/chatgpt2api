@@ -3,11 +3,16 @@ from unittest import mock
 
 from curl_cffi.requests import Headers
 
+from services.config import config
 from services.openai_backend_api import InvalidAccessTokenError, OpenAIBackendAPI
 
 
 class CloudflareRetryTests(unittest.TestCase):
     def setUp(self):
+        # 这里只测等待重试；不让挑战去找求解服务刷新 Cloudflare cookie（见 test_cf_cookies.py）
+        patcher = mock.patch.object(type(config), "sentinel_solver_url", new_callable=mock.PropertyMock, return_value="")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.api = OpenAIBackendAPI("")
         self.addCleanup(self.api.close)
 

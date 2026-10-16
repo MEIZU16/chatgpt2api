@@ -21,6 +21,7 @@ from curl_cffi import requests
 from PIL import Image
 
 from services.account_service import account_service
+from services.cf_cookie_cache import CF_COOKIE_NAMES, cf_cookie_cache
 from services.config import config
 from services.proxy_service import _redact_url_credentials, normalize_proxy_url, proxy_settings
 from services.sentinel_solver_client import solve_turnstile, solver_environment, solver_user_agent
@@ -249,6 +250,9 @@ class OpenAIBackendAPI:
         self.pow_data_build = ""
         # 网页上同一次生图的 f/conversation/prepare 和 f/conversation 共用一个 turn trace id
         self._image_turn_trace_id = ""
+        # 当前会话带的 Cloudflare cookie（求解服务浏览器取回），以及本客户端是否已经刷新过
+        self._cf_cookies: dict[str, str] = {}
+        self._cf_cookies_refreshed = False
         self.progress_callback: Callable[[str], None] | None = None
         self.proxy_url = proxy_settings.get_profile(account=self.account).proxy_url
         self.session = self._build_session()
@@ -372,9 +376,17 @@ class OpenAIBackendAPI:
             return False
         return str(response.headers.get("cf-mitigated") or "").strip().lower() == "challenge" or "text/html" in content_type
 
-    def _retry_cloudflare_challenge(self, request: Callable[[], requests.Response]) -> requests.Response:
-        """刷新账号信息时遇到临时挑战最多试三次（间隔 1.5s、3s），避免把健康账号误判成无额度。"""
-        response = request()
+    def _retry_cloudflare_challenge(
+        self, request: Callable[[], requests.Response], response: requests.Response | None = None
+    ) -> requests.Response:
+        """遇到 Cloudflare 挑战时先换上求解服务浏览器取回的 cookie 立即重试，
+        仍被挑战再最多试两次（间隔 1.5s、3s），避免把健康账号误判成无额度。
+
+        传入 response 表示第一次请求已经发过，直接从它开始判断。
+        """
+        response = request() if response is None else response
+        if self._is_cloudflare_challenge(response) and self._refresh_cf_cookies():
+            response = request()
         for attempt in range(1, 3):
             if not self._is_cloudflare_challenge(response):
                 return response
@@ -2790,8 +2802,10 @@ class OpenAIBackendAPI:
 
         首页是浏览器导航请求，不能带会话级的 OAI-* 接口头：带上后不少代理 IP 会被
         Cloudflare 托管挑战拦成 403（cf-mitigated: challenge），去掉即可正常通过。
-        同一 IP 也会间歇被挑战：先短暂重试，仍被挑战再临时切到已知可用的代理。
+        同一 IP 也会间歇被挑战：先带上缓存的浏览器 Cloudflare cookie，被挑战时刷新 cookie 并短暂重试，
+        仍被挑战再临时切到已知可用的代理。
         """
+        self._apply_cf_cookies(cf_cookie_cache.get_cached(self.proxy_url))
         response = self._retry_cloudflare_challenge(self._get_homepage)
         if self._is_cloudflare_challenge(response):
             _remember_bootstrap_proxy(self.proxy_url, healthy=False)
@@ -2801,6 +2815,30 @@ class OpenAIBackendAPI:
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
         if not self.pow_script_sources:
             self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+
+    def _apply_cf_cookies(self, cookies: dict[str, str]) -> None:
+        """把某个代理出口对应的 Cloudflare cookie 换进当前会话（先清掉旧的同名 cookie）。"""
+        if not cookies:
+            return
+        jar = self.session.cookies.jar
+        for cookie in list(jar):
+            if cookie.name in CF_COOKIE_NAMES:
+                jar.clear(cookie.domain, cookie.path, cookie.name)
+        for name, value in cookies.items():
+            self.session.cookies.set(name, value, domain=".chatgpt.com", path="/")
+        self._cf_cookies = dict(cookies)
+
+    def _refresh_cf_cookies(self) -> bool:
+        """当前代理被挑战时，让求解服务的浏览器重新取 cookie；每个客户端只刷新一次。"""
+        if self._cf_cookies_refreshed or not self.proxy_url:
+            return False
+        self._cf_cookies_refreshed = True
+        cookies = cf_cookie_cache.refresh(self.proxy_url, stale=self._cf_cookies)
+        if not cookies:
+            return False
+        self._apply_cf_cookies(cookies)
+        logger.info({"event": "cf_cookies_refreshed", "proxy": _proxy_label(self.proxy_url)})
+        return True
 
     def _get_homepage(self) -> requests.Response:
         oai_headers = {key: value for key, value in self.session.headers.items() if key.lower().startswith("oai-")}
@@ -2827,6 +2865,7 @@ class OpenAIBackendAPI:
                 if not cookie.name.startswith(("__cf", "cf_", "_cfuvid")):
                     session.cookies.jar.set_cookie(cookie)
             self.session = session
+            self._apply_cf_cookies(cf_cookie_cache.get_cached(proxy_url))
             try:
                 response = self._get_homepage()
             except Exception as exc:

@@ -4,6 +4,7 @@
 低质量时返回伪装成 404 的 "Model not found"。求解服务未配置或求解失败时直接报错（SentinelSolverError），
 不再退回本地求解器：它已跟不上新版挑战程序，算出的 token 只会换来伪装 404，并白白耗掉重试次数。
 求解服务只收到挑战材料（dx、p、prepare 响应），账号 token、cookie 和用户提示词都留在主服务。
+取 Cloudflare cookie 时求解服务还会收到要走的出口代理地址。
 """
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ from utils.log import logger
 SOLVER_TIMEOUT_SECONDS = 20
 # 页面自带的 turnstile 模块在冷页面上首次加载会慢一些
 SOLVER_SOLVE_TIMEOUT_SECONDS = 60
+# 取 cookie 要走指定代理新开一个页面
+SOLVER_CF_COOKIES_TIMEOUT_SECONDS = 90
 USER_AGENT_CACHE_SECONDS = 600
 
 _user_agent_lock = threading.Lock()
@@ -108,3 +111,32 @@ def solve_turnstile(dx: str, p: str, requirements: dict | None = None) -> str:
     if not token:
         raise SentinelSolverError("sentinel solver returned an empty turnstile token")
     return token
+
+
+def fetch_cloudflare_cookies(proxy_url: str) -> tuple[dict[str, str], float | None]:
+    """让求解服务的浏览器走 proxy_url 打开 chatgpt.com，返回 (Cloudflare cookie, 最早过期时间戳)。
+
+    这些 cookie 绑定出口 IP，只能用在同一个代理上。
+    """
+    base_url = config.sentinel_solver_url
+    if not base_url:
+        raise SentinelSolverError("sentinel solver is not configured")
+    try:
+        response = requests.post(
+            f"{base_url}/v1/cf-cookies",
+            headers=_solver_headers(),
+            json={"proxy": proxy_url},
+            timeout=SOLVER_CF_COOKIES_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        raise SentinelSolverError(f"sentinel solver cf-cookies request failed: {exc}") from exc
+    if response.status_code != 200:
+        raise SentinelSolverError(
+            f"sentinel solver cf-cookies returned HTTP {response.status_code}: {str(response.text or '')[:200]}"
+        )
+    payload = response.json() or {}
+    cookies = payload.get("cookies")
+    if not isinstance(cookies, dict):
+        raise SentinelSolverError("sentinel solver cf-cookies returned no cookies")
+    expires_at = payload.get("expires_at")
+    return {str(k): str(v) for k, v in cookies.items()}, (float(expires_at) if expires_at else None)
