@@ -22,7 +22,7 @@ from PIL import Image
 
 from services.account_service import account_service
 from services.config import config
-from services.proxy_service import proxy_settings
+from services.proxy_service import _redact_url_credentials, normalize_proxy_url, proxy_settings
 from services.sentinel_solver_client import solve_turnstile, solver_environment, solver_user_agent
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.log import logger
@@ -31,6 +31,46 @@ from utils.pow import build_legacy_requirements_token, build_proof_token, parse_
 
 class InvalidAccessTokenError(RuntimeError):
     pass
+
+
+# 首页预热成功过的代理（proxy_url -> 时间戳），挑战重试耗尽时用作临时切换的备选出口
+BOOTSTRAP_PROXY_HEALTHY_TTL_SECS = 600
+BOOTSTRAP_FAILOVER_MAX_PROXIES = 2
+_healthy_bootstrap_proxies: dict[str, float] = {}
+_healthy_bootstrap_proxies_lock = threading.Lock()
+
+
+def _remember_bootstrap_proxy(proxy_url: str, healthy: bool) -> None:
+    if not proxy_url:
+        return
+    with _healthy_bootstrap_proxies_lock:
+        if healthy:
+            _healthy_bootstrap_proxies[proxy_url] = time.time()
+        else:
+            _healthy_bootstrap_proxies.pop(proxy_url, None)
+
+
+def _bootstrap_failover_proxies(current_proxy: str) -> list[str]:
+    """最近预热成功的其他代理（新的在前），再加全局代理；不含当前代理。"""
+    cutoff = time.time() - BOOTSTRAP_PROXY_HEALTHY_TTL_SECS
+    with _healthy_bootstrap_proxies_lock:
+        for proxy_url, seen_at in list(_healthy_bootstrap_proxies.items()):
+            if seen_at < cutoff:
+                del _healthy_bootstrap_proxies[proxy_url]
+        recent = sorted(_healthy_bootstrap_proxies, key=_healthy_bootstrap_proxies.__getitem__, reverse=True)
+    candidates: list[str] = []
+    for proxy_url in [*recent, normalize_proxy_url(config.get_proxy_settings())]:
+        if proxy_url and proxy_url != current_proxy and proxy_url not in candidates:
+            candidates.append(proxy_url)
+    return candidates[:BOOTSTRAP_FAILOVER_MAX_PROXIES]
+
+
+def _proxy_label(proxy_url: str) -> str:
+    """日志里只记代理的 host:port，不泄露账号密码。"""
+    if not proxy_url:
+        return "direct"
+    parsed = urlparse(proxy_url)
+    return f"{parsed.hostname}:{parsed.port}" if parsed.port else str(parsed.hostname or "")
 
 
 class ImageTaskError(RuntimeError):
@@ -210,11 +250,8 @@ class OpenAIBackendAPI:
         # 网页上同一次生图的 f/conversation/prepare 和 f/conversation 共用一个 turn trace id
         self._image_turn_trace_id = ""
         self.progress_callback: Callable[[str], None] | None = None
-        self.session = requests.Session(**proxy_settings.build_session_kwargs(
-            account=self.account,
-            impersonate=self.fp["impersonate"],
-            verify=True,
-        ))
+        self.proxy_url = proxy_settings.get_profile(account=self.account).proxy_url
+        self.session = self._build_session()
         self.session.headers.update({
             "User-Agent": self.user_agent,
             "Origin": self.base_url,
@@ -243,6 +280,15 @@ class OpenAIBackendAPI:
         })
         if self.access_token:
             self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+
+    def _build_session(self, proxy: str = "") -> requests.Session:
+        """不传 proxy 时按账号代理建会话；传了则临时改走该代理（不改账号存储的代理）。"""
+        return requests.Session(**proxy_settings.build_session_kwargs(
+            account=None if proxy else self.account,
+            proxy=proxy,
+            impersonate=self.fp["impersonate"],
+            verify=True,
+        ))
 
     def close(self) -> None:
         if getattr(self, "_closed", False):
@@ -2744,7 +2790,19 @@ class OpenAIBackendAPI:
 
         首页是浏览器导航请求，不能带会话级的 OAI-* 接口头：带上后不少代理 IP 会被
         Cloudflare 托管挑战拦成 403（cf-mitigated: challenge），去掉即可正常通过。
+        同一 IP 也会间歇被挑战：先短暂重试，仍被挑战再临时切到已知可用的代理。
         """
+        response = self._retry_cloudflare_challenge(self._get_homepage)
+        if self._is_cloudflare_challenge(response):
+            _remember_bootstrap_proxy(self.proxy_url, healthy=False)
+            response = self._bootstrap_via_failover_proxy(response)
+        ensure_ok(response, "bootstrap")
+        _remember_bootstrap_proxy(self.proxy_url, healthy=True)
+        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
+        if not self.pow_script_sources:
+            self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+
+    def _get_homepage(self) -> requests.Response:
         oai_headers = {key: value for key, value in self.session.headers.items() if key.lower().startswith("oai-")}
         for key in oai_headers:
             del self.session.headers[key]
@@ -2756,10 +2814,45 @@ class OpenAIBackendAPI:
             )
         finally:
             self.session.headers.update(oai_headers)
-        ensure_ok(response, "bootstrap")
-        self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
-        if not self.pow_script_sources:
-            self.pow_script_sources = [DEFAULT_POW_SCRIPT]
+        return response
+
+    def _bootstrap_via_failover_proxy(self, challenged: requests.Response) -> requests.Response:
+        """当前代理 IP 一直被 Cloudflare 挑战时，本次客户端临时换到已知可用的代理重建会话。"""
+        for proxy_url in _bootstrap_failover_proxies(self.proxy_url):
+            previous_session = self.session
+            session = self._build_session(proxy_url)
+            session.headers.update(dict(previous_session.headers))
+            for cookie in previous_session.cookies.jar:
+                # Cloudflare 的 cookie 绑定出口 IP，换代理后不能沿用
+                if not cookie.name.startswith(("__cf", "cf_", "_cfuvid")):
+                    session.cookies.jar.set_cookie(cookie)
+            self.session = session
+            try:
+                response = self._get_homepage()
+            except Exception as exc:
+                response = None
+                error = _redact_url_credentials(str(exc))
+            else:
+                error = ""
+            if response is not None and 200 <= response.status_code < 300:
+                logger.warning({
+                    "event": "bootstrap_proxy_failover",
+                    "account_proxy": _proxy_label(self.proxy_url),
+                    "failover_proxy": _proxy_label(proxy_url),
+                })
+                self.proxy_url = proxy_url
+                previous_session.close()
+                return response
+            logger.warning({
+                "event": "bootstrap_proxy_failover_failed",
+                "account_proxy": _proxy_label(self.proxy_url),
+                "failover_proxy": _proxy_label(proxy_url),
+                "status": getattr(response, "status_code", None),
+                "error": error,
+            })
+            self.session = previous_session
+            session.close()
+        return challenged
 
     def _get_chat_requirements(self) -> ChatRequirements:
         """获取当前模式对话所需的 sentinel token（prepare + finalize 两步流程）。"""
