@@ -66,7 +66,9 @@ SOLVE_VIA_PAGE_MODULE = """async ([requirements, p, asset]) => {
     const mod = await import(asset);
     const turnstile = mod.turnstile || (mod.default && mod.default.turnstile);
     if (!turnstile || typeof turnstile.getEnforcementToken !== 'function') return 'ERR:getEnforcementToken missing';
-    // 模块用 WeakMap 以 requirements 为键取 p；token 缓存也是 WeakMap，不能动，否则会直接回显 p 而不跑挑战
+    // 模块用 WeakMap 以 requirements 为键取 p；token 缓存也是 WeakMap，不能动，否则会直接回显 p 而不跑挑战。
+    // 这个钩子挂在全局原型上：两次求解交错时，先结束的那次会把钩子摘掉，后一次就拿错 p 去解 dx，
+    // 报 "Unexpected token '<' ... is not valid JSON"。所以 Python 侧用 _solve_lock 让页面模块求解逐个进行。
     const cache = turnstile.tokenCache;
     const original = WeakMap.prototype.get;
     WeakMap.prototype.get = function (target) {
@@ -131,7 +133,15 @@ class SolverPage:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._opened_at = 0.0
+        self._stale = False
         self._lock = asyncio.Lock()
+        # 页面模块求解改写的是全局 WeakMap 原型，不能并发；单次求解远不到 1 秒，排队的代价很小
+        self._solve_lock = asyncio.Lock()
+        # 每次重开页面加一；失败的请求只能作废它用过的那一代页面，一波并发失败只会重开一次
+        self._generation = 0
+        # 每代页面上还在执行的 evaluate 数；被替换下来的上下文等它们跑完再关，免得别的请求看到页面被关
+        self._leases: dict[int, int] = {}
+        self._retired: dict[int, BrowserContext] = {}
         self.user_agent = USER_AGENT
         self.environment: dict[str, object] = {}
         self._turnstile_asset = ""
@@ -162,6 +172,9 @@ class SolverPage:
             print(f"[sentinel-solver] initial page open failed: {exc}", flush=True)
 
     async def stop(self) -> None:
+        for context in list(self._retired.values()):
+            await self._close_quietly(context)
+        self._retired.clear()
         if self._context is not None:
             await self._context.close()
         if self._browser is not None:
@@ -171,24 +184,57 @@ class SolverPage:
 
     async def page(self) -> Page:
         async with self._lock:
-            stale = self._page is None or time.monotonic() - self._opened_at > REFRESH_SECONDS
-            if not stale and not await self._is_ready(self._page):
-                stale = True
-            if stale:
-                await self._reopen()
-            return self._page
+            return await self._fresh_page()
 
-    async def invalidate(self) -> None:
+    async def _fresh_page(self) -> Page:
+        """调用方须持有 self._lock。"""
+        stale = self._stale or self._page is None or time.monotonic() - self._opened_at > REFRESH_SECONDS
+        if not stale and not await self._is_ready(self._page):
+            stale = True
+        if stale:
+            await self._reopen()
+        return self._page
+
+    @asynccontextmanager
+    async def _lease(self):
+        """借用当前页面执行一段操作；借用期间这代页面即使被替换也不会关闭。产出 (page, generation)。"""
         async with self._lock:
-            self._opened_at = 0.0
+            page = await self._fresh_page()
+            generation = self._generation
+            self._leases[generation] = self._leases.get(generation, 0) + 1
+        try:
+            yield page, generation
+        finally:
+            self._leases[generation] -= 1
+            if not self._leases[generation]:
+                del self._leases[generation]
+                retired = self._retired.pop(generation, None)
+                if retired is not None:
+                    await self._close_quietly(retired)
+
+    async def invalidate(self, generation: int | None = None) -> None:
+        """作废页面，下次使用时重开；给了 generation 时只在它仍是当前这代页面时才作废。"""
+        async with self._lock:
+            if generation is None or generation == self._generation:
+                self._stale = True
+
+    @staticmethod
+    async def _close_quietly(context: BrowserContext) -> None:
+        try:
+            await context.close()
+        except Exception:
+            pass
 
     async def _reopen(self) -> None:
         if self._context is not None:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
+            if self._leases.get(self._generation):
+                # 还有请求在旧页面上执行，等最后一个归还时再关
+                self._retired[self._generation] = self._context
+            else:
+                await self._close_quietly(self._context)
+            self._context = None
         self._page = None
+        self._generation += 1
         context_kwargs = {
             "locale": "zh-CN",
             "viewport": {"width": 1280, "height": 800},
@@ -214,6 +260,7 @@ class SolverPage:
         self._context = context
         self._page = page
         self._opened_at = time.monotonic()
+        self._stale = False
         self.last_error = ""
         print(f"[sentinel-solver] chatgpt.com page ready: {await page.title()!r}", flush=True)
 
@@ -250,29 +297,10 @@ class SolverPage:
     async def solve_turnstile(self, requirements: dict[str, Any] | None, dx: str, p: str) -> tuple[bool, str]:
         """优先用页面自带模块求解，失败再退回移植的 VM；返回 (是否成功, token 或失败原因)。"""
         if requirements:
-            error = ""
-            for attempt in range(1, PAGE_MODULE_ATTEMPTS + 1):
-                asset = await self.turnstile_asset()
-                try:
-                    raw = str(await self.evaluate(SOLVE_VIA_PAGE_MODULE, [requirements, p, asset]) or "")
-                except Exception as exc:
-                    error = str(exc)
-                    break
-                if raw.startswith("ERR:"):
-                    error = raw[4:]
-                    break
-                error = validate_turnstile_token(raw, p)
-                if not error:
-                    return True, raw
-                # 只有冷页面上的 VM 超时值得在热页面上重试
-                if not is_retryable_solve_error(error) or attempt == PAGE_MODULE_ATTEMPTS:
-                    break
-                print(f"[sentinel-solver] {error} (attempt {attempt}/{PAGE_MODULE_ATTEMPTS})", flush=True)
-            self.last_error = error[:300]
-            print(f"[sentinel-solver] page module solve failed: {error[:300]}", flush=True)
-            # 下次重新查找模块并重开页面
-            self._turnstile_asset = ""
-            await self.invalidate()
+            async with self._solve_lock:
+                ok, result = await self._solve_via_page_module(requirements, p)
+            if ok:
+                return True, result
         if not dx:
             return False, self.last_error or "no dx and no requirements supplied"
         result = str(await self.evaluate(SOLVE_VIA_VM, [dx, p]) or "")
@@ -281,17 +309,53 @@ class SolverPage:
         error = validate_turnstile_token(result, p)
         return (False, error) if error else (True, result)
 
+    async def _solve_via_page_module(self, requirements: dict[str, Any], p: str) -> tuple[bool, str]:
+        """调用方须持有 self._solve_lock。"""
+        error = ""
+        generation: int | None = None
+        for attempt in range(1, PAGE_MODULE_ATTEMPTS + 1):
+            asset = await self.turnstile_asset()
+            try:
+                value, generation = await self._evaluate(SOLVE_VIA_PAGE_MODULE, [requirements, p, asset])
+            except Exception as exc:
+                # evaluate 已经作废过出错的页面并重试过一次
+                error, generation = str(exc), None
+                break
+            raw = str(value or "")
+            if raw.startswith("ERR:"):
+                error = raw[4:]
+                break
+            error = validate_turnstile_token(raw, p)
+            if not error:
+                return True, raw
+            # 只有冷页面上的 VM 超时值得在热页面上重试
+            if not is_retryable_solve_error(error) or attempt == PAGE_MODULE_ATTEMPTS:
+                break
+            print(f"[sentinel-solver] {error} (attempt {attempt}/{PAGE_MODULE_ATTEMPTS})", flush=True)
+        self.last_error = error[:300]
+        print(f"[sentinel-solver] page module solve failed: {error[:300]}", flush=True)
+        # 下次重新查找模块并重开页面；页面若已被别的请求重开过，就沿用新页面和新找到的模块
+        if generation is not None and generation == self._generation:
+            self._turnstile_asset = ""
+            await self.invalidate(generation)
+        return False, error
+
     async def evaluate(self, expression: str, arg: object) -> object:
         """在页面里执行；页面失效时重开一次再试。"""
+        value, _ = await self._evaluate(expression, arg)
+        return value
+
+    async def _evaluate(self, expression: str, arg: object) -> tuple[object, int]:
+        """同 evaluate，另返回执行所在的页面代数。"""
         for attempt in range(2):
-            page = await self.page()
-            try:
-                return await page.evaluate(expression, arg)
-            except Exception as exc:
-                self.last_error = str(exc)
-                if attempt:
-                    raise
-                await self.invalidate()
+            async with self._lease() as (page, generation):
+                try:
+                    return await page.evaluate(expression, arg), generation
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    if attempt:
+                        raise
+            await self.invalidate(generation)
         raise RuntimeError("unreachable")
 
     async def cloudflare_cookies(self, proxy: str) -> dict[str, object]:
