@@ -11,7 +11,7 @@ from typing import Any, Iterable, Iterator
 
 import tiktoken
 
-from services.account_service import account_service
+from services.account_service import UploadQuotaExhaustedError, account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
@@ -115,6 +115,33 @@ def is_connection_timeout_error(message: str) -> bool:
         or "connection timed out" in text
         or "read timed out" in text
         or "connect timeout" in text
+    )
+
+
+UPLOAD_LIMIT_REASON = "upload_protection_limit_exceeded"
+
+
+def is_upload_limit_error(exc: BaseException) -> bool:
+    """检测账号文件上传额度用尽（POST /backend-api/files 返回 429 upload_protection_limit_exceeded）。"""
+    if not isinstance(exc, UpstreamHTTPError) or exc.status_code != 429:
+        return False
+    body = exc.body
+    detail = body.get("detail") if isinstance(body, dict) else None
+    for item in (detail, body):
+        if isinstance(item, dict) and item.get("reason") == UPLOAD_LIMIT_REASON:
+            return True
+    if UPLOAD_LIMIT_REASON in str(body):
+        return True
+    return str(exc.context or "").startswith("/backend-api/files")
+
+
+def upload_limit_exhausted_error(account_email: str = "") -> "ImageGenerationError":
+    return ImageGenerationError(
+        "Image upload quota is exhausted for all available accounts in the pool. Please try again later.",
+        status_code=429,
+        error_type="insufficient_quota",
+        code="upload_limit_exceeded",
+        account_email=account_email,
     )
 
 
@@ -1319,12 +1346,15 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 文件上传额度用尽（429）最大重试次数（冷却该账号后换账号重试）
+    MAX_UPLOAD_LIMIT_RETRIES = 5
     model_not_found_retry_count = 0
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    upload_limit_retry_count = 0
     account_email = ""
 
     while True:
@@ -1337,7 +1367,11 @@ def _generate_single_image(
                 plan_type=plan_type,
                 source_type="codex" if codex_model else None,
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
+                # 网页端图片编辑需要先把参考图上传到 /backend-api/files
+                require_upload=bool(request.images) and not codex_model,
             )
+        except UploadQuotaExhaustedError as exc:
+            raise upload_limit_exhausted_error(account_email) from exc
         except RuntimeError as exc:
             raise ImageGenerationError(str(exc) or "image generation failed", account_email=account_email) from exc
 
@@ -1498,6 +1532,27 @@ def _generate_single_image(
                 "error": last_error,
                 "index": index,
             })
+            # 文件上传额度用尽：冷却该账号的上传用途，换账号重试
+            if not emitted_for_token and is_upload_limit_error(exc):
+                account_service.sideline_upload_account(token, reason=UPLOAD_LIMIT_REASON)
+                upload_limit_retry_count += 1
+                if upload_limit_retry_count <= MAX_UPLOAD_LIMIT_RETRIES:
+                    logger.warning({
+                        "event": "image_upload_limit_retry",
+                        "request_token": token,
+                        "account_email": account_email,
+                        "retry_count": upload_limit_retry_count,
+                        "index": index,
+                    })
+                    continue
+                logger.warning({
+                    "event": "image_upload_limit_exhausted_retries",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "retry_count": upload_limit_retry_count,
+                    "index": index,
+                })
+                raise upload_limit_exhausted_error(account_email) from exc
             if not emitted_for_token and is_image_model_not_found_error(exc):
                 # 只在本地暂避这个账号、换号重试，不改额度、有效性或代理健康分
                 account_service.sideline_image_account(token, IMAGE_MODEL_NOT_FOUND_COOLDOWN_SECS)

@@ -21,8 +21,16 @@ from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
 
+class UploadQuotaExhaustedError(RuntimeError):
+    """号池里有生图额度，但所有可选账号的文件上传额度都已用完或处于冷却中。"""
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
+
+    # 文件上传被限流（upload_protection_limit_exceeded）后的冷却时间。上游提示 23 小时，
+    # 这里只冷却 1 小时，之后由刷新得到的 limits_progress(file_upload) 决定是否可用。
+    _UPLOAD_COOLDOWN_SECONDS = 60 * 60
 
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
@@ -59,6 +67,8 @@ class AccountService:
         self._image_inflight: dict[str, int] = {}
         # 生图返回伪装 404 的账号在本进程内暂避到此时刻（time.monotonic），不改额度和账号状态
         self._image_unavailable_until: dict[str, float] = {}
+        # 内存态：token -> 文件上传冷却截止时间（time.time()）
+        self._upload_cooldowns: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -147,6 +157,59 @@ class AccountService:
         if account.get("status") in {"禁用", "限流", "异常"}:
             return False
         return int(account.get("quota") or 0) > 0
+
+    @classmethod
+    def _cached_file_upload_limit(cls, account: dict) -> tuple[int | None, datetime | None]:
+        """从缓存的 limits_progress 里读取 file_upload 剩余次数和重置时间；没有该项时返回 (None, None)。"""
+        for item in account.get("limits_progress") or []:
+            if isinstance(item, dict) and item.get("feature_name") == "file_upload":
+                try:
+                    remaining = int(item.get("remaining") or 0)
+                except (TypeError, ValueError):
+                    remaining = 0
+                return remaining, cls._parse_time(item.get("reset_after"))
+        return None, None
+
+    def _is_upload_available_locked(self, account: dict) -> bool:
+        if not isinstance(account, dict):
+            return False
+        token = str(account.get("access_token") or "")
+        now = time.time()
+        cooldown_until = self._upload_cooldowns.get(token)
+        if cooldown_until:
+            if cooldown_until > now:
+                return False
+            self._upload_cooldowns.pop(token, None)
+        remaining, reset_at = self._cached_file_upload_limit(account)
+        if remaining is not None and remaining <= 0:
+            return reset_at is not None and reset_at <= datetime.now(timezone.utc)
+        return True
+
+    def is_upload_available(self, access_token: str) -> bool:
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(access_token)
+            return account is not None and self._is_upload_available_locked(account)
+
+    def sideline_upload_account(self, access_token: str, seconds: float | None = None, reason: str = "") -> None:
+        """账号文件上传被限流后，在冷却期内不再分配给需要上传图片的请求（图片编辑）。"""
+        if not access_token:
+            return
+        duration = float(self._UPLOAD_COOLDOWN_SECONDS if seconds is None else seconds)
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            self._upload_cooldowns[access_token] = time.time() + max(0.0, duration)
+            account = self._accounts.get(access_token) or {}
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "账号文件上传受限，暂停用于图片编辑",
+            {
+                "token": anonymize_token(access_token),
+                "email": account.get("email") or "",
+                "cooldown_seconds": int(duration),
+                "reason": reason,
+            },
+        )
 
     @classmethod
     def _account_matches_plan_type(cls, account: dict, plan_type: str | None = None) -> bool:
@@ -435,6 +498,9 @@ class AccountService:
                 old_inflight = int(self._image_inflight.pop(old_token, 0))
                 if old_inflight:
                     self._image_inflight[new_token] = int(self._image_inflight.get(new_token, 0)) + old_inflight
+                old_upload_cooldown = self._upload_cooldowns.pop(old_token, None)
+                if old_upload_cooldown:
+                    self._upload_cooldowns[new_token] = old_upload_cooldown
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
@@ -904,6 +970,7 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            require_upload: bool = False,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
         return [
@@ -914,6 +981,7 @@ class AccountService:
                and self._account_matches_plan_type(item, plan_type)
                and self._account_matches_any_plan_type(item, plan_types)
                and self._account_matches_source_type(item, source_type)
+               and (not require_upload or self._is_upload_available_locked(item))
                and (token := item.get("access_token") or "")
                and token not in excluded
         ]
@@ -924,11 +992,14 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            require_upload: bool = False,
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         return [
             token
-            for token in self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+            for token in self._list_ready_candidate_tokens(
+                excluded_tokens, plan_type, source_type, plan_types, require_upload,
+            )
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
 
@@ -938,15 +1009,24 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            require_upload: bool = False,
     ) -> str:
         with self._image_slot_condition:
             while True:
-                if not self._list_ready_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types):
+                if not self._list_ready_candidate_tokens(
+                        excluded_tokens, plan_type, source_type, plan_types, require_upload,
+                ):
+                    if require_upload and self._list_ready_candidate_tokens(
+                            excluded_tokens, plan_type, source_type, plan_types,
+                    ):
+                        raise UploadQuotaExhaustedError("no available image upload quota")
                     raise RuntimeError(
                         f"no available {plan_type or source_type or ''} image quota".replace("  ", " ").strip()
                         if plan_type or source_type else "no available image quota"
                     )
-                tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
+                tokens = self._list_available_candidate_tokens(
+                    excluded_tokens, plan_type, source_type, plan_types, require_upload,
+                )
                 if tokens:
                     access_token = tokens[self._index % len(tokens)]
                     self._index += 1
@@ -978,21 +1058,33 @@ class AccountService:
             plan_type: str | None = None,
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
+            require_upload: bool = False,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
         基于本地缓存做初筛，然后通过 fetch_remote_info 做远程验证（token 有效性、配额等）。
         限制最大尝试次数防止 token rotation 导致无限循环。
+        require_upload=True（图片编辑需要上传参考图）时，跳过文件上传额度已用完或处于冷却中的账号；
+        若仅因上传额度不足而无号可用，抛出 UploadQuotaExhaustedError。
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
+        upload_blocked = False
         for _attempt in range(max_attempts):
-            access_token = self._acquire_next_candidate_token(
-                excluded_tokens=attempted_tokens,
-                plan_type=plan_type,
-                source_type=source_type,
-                plan_types=plan_types,
-            )
+            try:
+                access_token = self._acquire_next_candidate_token(
+                    excluded_tokens=attempted_tokens,
+                    plan_type=plan_type,
+                    source_type=source_type,
+                    plan_types=plan_types,
+                    require_upload=require_upload,
+                )
+            except UploadQuotaExhaustedError:
+                raise
+            except RuntimeError as exc:
+                if upload_blocked:
+                    raise UploadQuotaExhaustedError("no available image upload quota") from exc
+                raise
             attempted_tokens.add(access_token)
             try:
                 account = self.fetch_remote_info(access_token, "get_available_access_token")
@@ -1010,8 +1102,12 @@ class AccountService:
                     and self._account_matches_any_plan_type(account or {}, plan_types)
                     and self._account_matches_source_type(account or {}, source_type)
             ):
-                return str((account or {}).get("access_token") or access_token)
+                if not require_upload or self.is_upload_available(resolved or access_token):
+                    return str((account or {}).get("access_token") or access_token)
+                upload_blocked = True
             self.release_image_slot(access_token)
+        if upload_blocked:
+            raise UploadQuotaExhaustedError("no available image upload quota")
         raise RuntimeError(
             f"no available {plan_type or source_type or ''} image quota (tried {len(attempted_tokens)} tokens)".replace("  ", " ").strip()
             if plan_type or source_type else f"no available image quota (tried {len(attempted_tokens)} tokens)"
