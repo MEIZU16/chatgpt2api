@@ -11,7 +11,7 @@ from typing import Any, Iterable, Iterator
 
 import tiktoken
 
-from services.account_service import UploadQuotaExhaustedError, account_service
+from services.account_service import MainModelQuotaExhaustedError, UploadQuotaExhaustedError, account_service
 from services.config import config
 from services.image_storage_service import image_storage_service
 from services.openai_backend_api import ImageContentPolicyError, ImagePollTimeoutError, OpenAIBackendAPI
@@ -141,6 +141,42 @@ def upload_limit_exhausted_error(account_email: str = "") -> "ImageGenerationErr
         status_code=429,
         error_type="insufficient_quota",
         code="upload_limit_exceeded",
+        account_email=account_email,
+    )
+
+
+class ImageToolUnavailableError(ImageGenerationError):
+    """上游把账号降级到只出文字的 Mini 模型（主模型额度用完），生图工具不可用。"""
+
+
+# 上游这种情况下的固定开头；后面的说明（Instant 限额已达到、Mini 仅支持文本）会随语言变化
+_IMAGE_TOOL_UNAVAILABLE_MARKERS = (
+    "image creation is temporarily unavailable",
+    "图像生成工具暂时不可用",
+    "图像生成工具当前不可用",
+)
+_MINI_TEXT_ONLY_MARKERS = (
+    "mini model is text-only",
+    "mini 模型仅支持文本",
+    "mini 模型只支持文本",
+)
+
+
+def is_image_tool_unavailable_reply(message: str) -> bool:
+    """检测上游因主模型额度用完、降级到 Mini 而回复「生图暂时不可用」。"""
+    text = str(message or "").lower()
+    if not text:
+        return False
+    return any(item in text for item in _IMAGE_TOOL_UNAVAILABLE_MARKERS + _MINI_TEXT_ONLY_MARKERS)
+
+
+def main_model_exhausted_error(account_email: str = "") -> "ImageGenerationError":
+    return ImageGenerationError(
+        "Image generation is unavailable: every available account in the pool has used up its main model quota. "
+        "Please try again later.",
+        status_code=429,
+        error_type="insufficient_quota",
+        code="image_model_quota_exhausted",
         account_email=account_email,
     )
 
@@ -929,6 +965,9 @@ def stream_image_outputs(
     })
     if request.progress_callback:
         request.progress_callback("image_stream_resolve_start")
+    if message and not file_ids and not sediment_ids and is_image_tool_unavailable_reply(message):
+        # 不必再轮询：降级后的 Mini 不会出图，交给上层换号重试
+        raise ImageToolUnavailableError(message, conversation_id=conversation_id)
     if message and not file_ids and not sediment_ids and last.get("blocked"):
         # 尝试从 /backend-api/tasks/ 获取详细错误信息
         detailed_error = _get_detailed_error_from_tasks(backend, conversation_id)
@@ -1348,6 +1387,8 @@ def _generate_single_image(
     MAX_POLL_TIMEOUT_RETRIES = 4
     # 文件上传额度用尽（429）最大重试次数（冷却该账号后换账号重试）
     MAX_UPLOAD_LIMIT_RETRIES = 5
+    # 主模型额度用完、被降级到 Mini 的最大重试次数（暂避该账号后换账号重试）
+    MAX_MAIN_MODEL_RETRIES = 5
     model_not_found_retry_count = 0
 
     text_reply_retry_count = 0
@@ -1355,6 +1396,7 @@ def _generate_single_image(
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
     upload_limit_retry_count = 0
+    main_model_retry_count = 0
     account_email = ""
 
     while True:
@@ -1369,7 +1411,11 @@ def _generate_single_image(
                 plan_types=("plus", "team", "pro") if codex_model and not plan_type else None,
                 # 网页端图片编辑需要先把参考图上传到 /backend-api/files
                 require_upload=bool(request.images) and not codex_model,
+                # 网页端生图走主模型，主模型额度用完会被降级到只出文字的 Mini
+                require_main_model=not codex_model,
             )
+        except MainModelQuotaExhaustedError as exc:
+            raise main_model_exhausted_error(account_email) from exc
         except UploadQuotaExhaustedError as exc:
             raise upload_limit_exhausted_error(account_email) from exc
         except RuntimeError as exc:
@@ -1463,6 +1509,23 @@ def _generate_single_image(
                 })
                 raise
             raise
+        except ImageToolUnavailableError as exc:
+            # 结果只在本函数里缓存，还没发给下游，可以安全换号
+            account_service.mark_image_result(token, False)
+            cooldown = account_service.sideline_main_model_exhausted(token)
+            main_model_retry_count += 1
+            logger.warning({
+                "event": "image_main_model_exhausted_retry",
+                "request_token": token,
+                "account_email": account_email,
+                "retry_count": main_model_retry_count,
+                "cooldown_seconds": cooldown,
+                "index": index,
+                "message_preview": str(exc)[:200],
+            })
+            if main_model_retry_count <= MAX_MAIN_MODEL_RETRIES:
+                continue
+            raise main_model_exhausted_error(account_email) from exc
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
             logger.warning({

@@ -25,12 +25,23 @@ class UploadQuotaExhaustedError(RuntimeError):
     """号池里有生图额度，但所有可选账号的文件上传额度都已用完或处于冷却中。"""
 
 
+class MainModelQuotaExhaustedError(RuntimeError):
+    """号池里有生图额度，但所有可选账号的主模型额度（reason）都已用完。
+
+    主模型额度用完后上游降级到只出文字的 Mini 模型，生图工具直接报 system_error。
+    """
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
     # 文件上传被限流（upload_protection_limit_exceeded）后的冷却时间。上游提示 23 小时，
     # 这里只冷却 1 小时，之后由刷新得到的 limits_progress(file_upload) 决定是否可用。
     _UPLOAD_COOLDOWN_SECONDS = 60 * 60
+    # 主模型额度用完、上游降级到 Mini 后，生图暂避到额度重置；拿不到重置时间时用这个默认值，并限制上下界
+    _MAIN_MODEL_COOLDOWN_DEFAULT_SECONDS = 30 * 60
+    _MAIN_MODEL_COOLDOWN_MIN_SECONDS = 60
+    _MAIN_MODEL_COOLDOWN_MAX_SECONDS = 6 * 60 * 60
 
     _NEW_ACCOUNT_INVALID_GRACE_SECONDS = 10 * 60
     _INVALID_CONFIRM_SECONDS = 30
@@ -69,6 +80,8 @@ class AccountService:
         self._image_unavailable_until: dict[str, float] = {}
         # 内存态：token -> 文件上传冷却截止时间（time.time()）
         self._upload_cooldowns: dict[str, float] = {}
+        # 内存态：token -> 主模型额度用完后的生图暂避截止时间（time.monotonic）
+        self._main_model_cooldowns: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -161,8 +174,13 @@ class AccountService:
     @classmethod
     def _cached_file_upload_limit(cls, account: dict) -> tuple[int | None, datetime | None]:
         """从缓存的 limits_progress 里读取 file_upload 剩余次数和重置时间；没有该项时返回 (None, None)。"""
+        return cls._cached_feature_limit(account, "file_upload")
+
+    @classmethod
+    def _cached_feature_limit(cls, account: dict, feature_name: str) -> tuple[int | None, datetime | None]:
+        """从缓存的 limits_progress 里读取某项额度的剩余次数和重置时间；没有该项时返回 (None, None)。"""
         for item in account.get("limits_progress") or []:
-            if isinstance(item, dict) and item.get("feature_name") == "file_upload":
+            if isinstance(item, dict) and item.get("feature_name") == feature_name:
                 try:
                     remaining = int(item.get("remaining") or 0)
                 except (TypeError, ValueError):
@@ -184,6 +202,51 @@ class AccountService:
         if remaining is not None and remaining <= 0:
             return reset_at is not None and reset_at <= datetime.now(timezone.utc)
         return True
+
+    def _is_main_model_available(self, account: dict) -> bool:
+        """主模型额度（reason）未用完且不在暂避期；缓存里没有该项（如付费号）时视为可用。"""
+        if not isinstance(account, dict):
+            return False
+        token = str(account.get("access_token") or "")
+        cooldown_until = self._main_model_cooldowns.get(token)
+        if cooldown_until:
+            if cooldown_until > time.monotonic():
+                return False
+            self._main_model_cooldowns.pop(token, None)
+        remaining, reset_at = self._cached_feature_limit(account, "reason")
+        if remaining is not None and remaining <= 0:
+            return reset_at is not None and reset_at <= datetime.now(timezone.utc)
+        return True
+
+    def sideline_main_model_exhausted(self, access_token: str) -> int:
+        """账号主模型额度用完（生图被降级到 Mini）：暂避到额度重置，并把缓存的 reason 剩余记为 0。返回暂避秒数。"""
+        if not access_token:
+            return 0
+        with self._image_slot_condition:
+            access_token = self._resolve_access_token_locked(access_token)
+            account = self._accounts.get(access_token) or {}
+            _, reset_at = self._cached_feature_limit(account, "reason")
+            seconds = self._MAIN_MODEL_COOLDOWN_DEFAULT_SECONDS
+            if reset_at is not None:
+                seconds = int((reset_at - datetime.now(timezone.utc)).total_seconds())
+                if seconds <= 0:
+                    seconds = self._MAIN_MODEL_COOLDOWN_DEFAULT_SECONDS
+            seconds = max(self._MAIN_MODEL_COOLDOWN_MIN_SECONDS, min(self._MAIN_MODEL_COOLDOWN_MAX_SECONDS, seconds))
+            for item in account.get("limits_progress") or []:
+                if isinstance(item, dict) and item.get("feature_name") == "reason":
+                    item["remaining"] = 0
+            self._main_model_cooldowns[access_token] = time.monotonic() + seconds
+            self._image_slot_condition.notify_all()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "账号主模型额度已用完，生图被降级到 Mini，暂停用于生图",
+            {
+                "token": anonymize_token(access_token),
+                "email": account.get("email") or "",
+                "cooldown_seconds": seconds,
+            },
+        )
+        return seconds
 
     def is_upload_available(self, access_token: str) -> bool:
         with self._lock:
@@ -501,6 +564,9 @@ class AccountService:
                 old_upload_cooldown = self._upload_cooldowns.pop(old_token, None)
                 if old_upload_cooldown:
                     self._upload_cooldowns[new_token] = old_upload_cooldown
+                old_main_model_cooldown = self._main_model_cooldowns.pop(old_token, None)
+                if old_main_model_cooldown:
+                    self._main_model_cooldowns[new_token] = old_main_model_cooldown
             self._accounts[new_token] = account
             self._save_accounts()
             self._image_slot_condition.notify_all()
@@ -971,6 +1037,7 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             require_upload: bool = False,
+            require_main_model: bool = False,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
         return [
@@ -982,6 +1049,7 @@ class AccountService:
                and self._account_matches_any_plan_type(item, plan_types)
                and self._account_matches_source_type(item, source_type)
                and (not require_upload or self._is_upload_available_locked(item))
+               and (not require_main_model or self._is_main_model_available(item))
                and (token := item.get("access_token") or "")
                and token not in excluded
         ]
@@ -993,12 +1061,13 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             require_upload: bool = False,
+            require_main_model: bool = False,
     ) -> list[str]:
         max_concurrency = max(1, int(config.image_account_concurrency or 1))
         return [
             token
             for token in self._list_ready_candidate_tokens(
-                excluded_tokens, plan_type, source_type, plan_types, require_upload,
+                excluded_tokens, plan_type, source_type, plan_types, require_upload, require_main_model,
             )
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
@@ -1010,12 +1079,17 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             require_upload: bool = False,
+            require_main_model: bool = False,
     ) -> str:
         with self._image_slot_condition:
             while True:
                 if not self._list_ready_candidate_tokens(
-                        excluded_tokens, plan_type, source_type, plan_types, require_upload,
+                        excluded_tokens, plan_type, source_type, plan_types, require_upload, require_main_model,
                 ):
+                    if require_main_model and self._list_ready_candidate_tokens(
+                            excluded_tokens, plan_type, source_type, plan_types, require_upload,
+                    ):
+                        raise MainModelQuotaExhaustedError("no available main model quota for image generation")
                     if require_upload and self._list_ready_candidate_tokens(
                             excluded_tokens, plan_type, source_type, plan_types,
                     ):
@@ -1025,7 +1099,7 @@ class AccountService:
                         if plan_type or source_type else "no available image quota"
                     )
                 tokens = self._list_available_candidate_tokens(
-                    excluded_tokens, plan_type, source_type, plan_types, require_upload,
+                    excluded_tokens, plan_type, source_type, plan_types, require_upload, require_main_model,
                 )
                 if tokens:
                     access_token = tokens[self._index % len(tokens)]
@@ -1059,6 +1133,7 @@ class AccountService:
             source_type: str | None = None,
             plan_types: set[str] | tuple[str, ...] | None = None,
             require_upload: bool = False,
+            require_main_model: bool = False,
     ) -> str:
         """从候选池中获取一个可用的图片生图 token。
 
@@ -1066,10 +1141,13 @@ class AccountService:
         限制最大尝试次数防止 token rotation 导致无限循环。
         require_upload=True（图片编辑需要上传参考图）时，跳过文件上传额度已用完或处于冷却中的账号；
         若仅因上传额度不足而无号可用，抛出 UploadQuotaExhaustedError。
+        require_main_model=True（网页端生图）时，跳过主模型额度（reason）已用完的账号：这些账号会被
+        上游降级到只出文字的 Mini，生图必然失败；若仅因此无号可用，抛出 MainModelQuotaExhaustedError。
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
         upload_blocked = False
+        main_model_blocked = False
         for _attempt in range(max_attempts):
             try:
                 access_token = self._acquire_next_candidate_token(
@@ -1078,10 +1156,13 @@ class AccountService:
                     source_type=source_type,
                     plan_types=plan_types,
                     require_upload=require_upload,
+                    require_main_model=require_main_model,
                 )
-            except UploadQuotaExhaustedError:
+            except (UploadQuotaExhaustedError, MainModelQuotaExhaustedError):
                 raise
             except RuntimeError as exc:
+                if main_model_blocked:
+                    raise MainModelQuotaExhaustedError("no available main model quota for image generation") from exc
                 if upload_blocked:
                     raise UploadQuotaExhaustedError("no available image upload quota") from exc
                 raise
@@ -1102,10 +1183,15 @@ class AccountService:
                     and self._account_matches_any_plan_type(account or {}, plan_types)
                     and self._account_matches_source_type(account or {}, source_type)
             ):
-                if not require_upload or self.is_upload_available(resolved or access_token):
+                if require_main_model and not self._is_main_model_available(account or {}):
+                    main_model_blocked = True
+                elif not require_upload or self.is_upload_available(resolved or access_token):
                     return str((account or {}).get("access_token") or access_token)
-                upload_blocked = True
+                else:
+                    upload_blocked = True
             self.release_image_slot(access_token)
+        if main_model_blocked:
+            raise MainModelQuotaExhaustedError("no available main model quota for image generation")
         if upload_blocked:
             raise UploadQuotaExhaustedError("no available image upload quota")
         raise RuntimeError(
