@@ -23,6 +23,10 @@
 
 ## 部署
 
+线上在 eu-main（主机信息见本机 server-ops 文档）上使用 GHCR 预构建镜像（`ghcr.io/meizu16/sentinel-solver:sha-<commit 前 7 位>`）部署，不在主机上直接 `--build`；镜像构建、切换、验证与回滚步骤见仓库根目录的 [`DEPLOY.fork.md`](../DEPLOY.fork.md)。
+
+本地开发调试可直接用根目录 compose 构建启动：
+
 ```bash
 docker compose up -d --build sentinel-solver
 ```
